@@ -333,6 +333,86 @@ class UploadReceiptTest(unittest.TestCase):
         self.assertEqual(call_count["n"], 1)
 
 
+class DeleteTransactionTest(unittest.TestCase):
+    """C22 — BezalaClient.delete_transaction (DELETE /transactions/{id})."""
+
+    def test_delete_success_returns_deleted_true(self):
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 204
+        resp.headers = {"content-type": "application/json"}
+        resp.text = ""
+
+        captured = {}
+
+        def fake_request(method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            return resp
+
+        client._client.request = fake_request
+
+        result = client.delete_transaction("2804")
+        self.assertEqual(result, {"deleted": True})
+        self.assertEqual(captured["method"], "DELETE")
+        self.assertTrue(captured["url"].endswith("/transactions/2804"))
+
+    def test_delete_404_is_idempotent(self):
+        """Redan raderat utkast → already_gone=True så caller kan rensa
+        lokal koppling utan att blockera på Bezala."""
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.headers = {"content-type": "application/json"}
+        resp.text = '{"error": "not found"}'
+
+        client._client.request = MagicMock(return_value=resp)
+
+        result = client.delete_transaction(9999)
+        self.assertEqual(result, {"deleted": True, "already_gone": True})
+
+    def test_delete_500_raises_bezala_error(self):
+        from app.services.bezala_client import BezalaError
+
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.headers = {"content-type": "text/plain"}
+        resp.text = "internal server error"
+
+        # Bypass retries genom att returnera 500 från alla försök
+        client._client.request = MagicMock(return_value=resp)
+
+        with self.assertRaises(BezalaError) as ctx:
+            client.delete_transaction("tx-bad")
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertIn("internal server error", ctx.exception.body or "")
+
+    def test_delete_422_raises_bezala_error(self):
+        """Endast 404 är idempotent — andra 4xx (t.ex. 422 redan attesterad)
+        ska bubbla upp som fel så att caller behåller lokal koppling."""
+        from app.services.bezala_client import BezalaError
+
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 422
+        resp.headers = {"content-type": "application/json"}
+        resp.text = '{"errors": ["redan attesterad"]}'
+
+        client._client.request = MagicMock(return_value=resp)
+
+        with self.assertRaises(BezalaError) as ctx:
+            client.delete_transaction("tx-locked")
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_delete_rejects_empty_id(self):
+        from app.services.bezala_client import BezalaError
+
+        client = _make_client()
+        with self.assertRaises(BezalaError):
+            client.delete_transaction("")
+
+
 class PipelineAutoUploadTest(unittest.TestCase):
     """_attempt_bezala_upload använder metadata + field-mapper."""
 

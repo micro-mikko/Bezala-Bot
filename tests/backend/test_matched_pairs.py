@@ -222,16 +222,40 @@ class MatchedPairsEndpointTest(_Base):
 
 
 class UnmatchEndpointTest(_Base):
+    """C22 — unmatch raderar utkastet i Bezala (DELETE /transactions/{id})
+    och rensar sedan lokal koppling. Tester mockar BezalaClient så vi
+    aldrig anropar live-API:t."""
+
+    def _post_unmatch(self, message_id, *, delete_result=None, delete_side_effect=None):
+        """Helper: mocka BezalaClient.delete_transaction och anropa unmatch.
+
+        Returnerar (response, fake_bezala) så tester kan asserta att
+        delete_transaction kallades med rätt tx_id."""
+        fake_bezala = MagicMock()
+        if delete_side_effect is not None:
+            fake_bezala.delete_transaction.side_effect = delete_side_effect
+        else:
+            fake_bezala.delete_transaction.return_value = (
+                delete_result if delete_result is not None else {"deleted": True}
+            )
+        with patch.object(self.app_module, "BezalaClient", return_value=fake_bezala):
+            resp = self.client.post(f"/api/bezala/unmatch/{message_id}")
+        return resp, fake_bezala
+
     def test_unmatch_clears_fields(self):
         self._seed(message_id="m-1",
                    bezala_transaction_id="bz-9",
                    bezala_upload_status="success",
                    matched_at=datetime.utcnow())
-        resp = self.client.post("/api/bezala/unmatch/m-1")
+        resp, fake_bezala = self._post_unmatch("m-1")
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         self.assertTrue(body["success"])
         self.assertEqual(body["old_bezala_transaction_id"], "bz-9")
+        self.assertTrue(body["bezala_deleted"])
+        self.assertFalse(body["bezala_already_gone"])
+        # Bezala DELETE ska ha anropats med tx-id
+        fake_bezala.delete_transaction.assert_called_once_with("bz-9")
         with self.SessionLocal() as db:
             row = db.query(self.ProcessedMessage).filter_by(message_id="m-1").first()
             self.assertIsNone(row.bezala_transaction_id)
@@ -259,7 +283,7 @@ class UnmatchEndpointTest(_Base):
             bezala_payment_currency="EUR",
             bezala_payment_date="2026-04-30",
         )
-        resp = self.client.post("/api/bezala/unmatch/m-snap")
+        resp, _ = self._post_unmatch("m-snap")
         self.assertEqual(resp.status_code, 200)
         with self.SessionLocal() as db:
             row = (
@@ -271,6 +295,99 @@ class UnmatchEndpointTest(_Base):
             self.assertIsNone(row.bezala_payment_amount)
             self.assertIsNone(row.bezala_payment_currency)
             self.assertIsNone(row.bezala_payment_date)
+
+    def test_unmatch_already_deleted_is_idempotent(self):
+        """C22: Bezala returnerar 404 (utkast redan borta) → vi ska
+        ändå rensa lokal koppling och returnera 200 med already_gone=True."""
+        self._seed(
+            message_id="m-gone",
+            bezala_transaction_id="bz-gone",
+            bezala_upload_status="success",
+            matched_at=datetime.utcnow(),
+        )
+        resp, fake_bezala = self._post_unmatch(
+            "m-gone",
+            delete_result={"deleted": True, "already_gone": True},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["bezala_deleted"])
+        self.assertTrue(body["bezala_already_gone"])
+        fake_bezala.delete_transaction.assert_called_once_with("bz-gone")
+        with self.SessionLocal() as db:
+            row = db.query(self.ProcessedMessage).filter_by(
+                message_id="m-gone",
+            ).first()
+            self.assertIsNone(row.bezala_transaction_id)
+            self.assertEqual(row.bezala_upload_status, "pending")
+
+    def test_unmatch_bezala_5xx_preserves_local_state(self):
+        """C22: Bezala kastar 500 → 502 till klienten, lokal koppling
+        bibehållen så användaren kan försöka igen."""
+        from app.services.bezala_client import BezalaError
+
+        self._seed(
+            message_id="m-fail",
+            bezala_transaction_id="bz-fail",
+            bezala_upload_status="success",
+            matched_at=datetime.utcnow(),
+            bezala_payment_merchant="ORIGINAL",
+            bezala_payment_amount=100.0,
+            bezala_payment_currency="EUR",
+            bezala_payment_date="2026-04-30",
+        )
+        resp, fake_bezala = self._post_unmatch(
+            "m-fail",
+            delete_side_effect=BezalaError(
+                "Bezala delete_transaction: 500",
+                status_code=500,
+                body="internal server error",
+            ),
+        )
+        self.assertEqual(resp.status_code, 502, resp.text)
+        body = resp.json()
+        # FastAPI lägger error-detaljerna under "detail"
+        detail = body["detail"]
+        self.assertEqual(detail["bezala_status"], 500)
+        self.assertEqual(detail["local_state"], "unchanged")
+        fake_bezala.delete_transaction.assert_called_once_with("bz-fail")
+        # Lokal koppling ska vara intakt
+        with self.SessionLocal() as db:
+            row = db.query(self.ProcessedMessage).filter_by(
+                message_id="m-fail",
+            ).first()
+            self.assertEqual(row.bezala_transaction_id, "bz-fail")
+            self.assertEqual(row.bezala_upload_status, "success")
+            self.assertIsNotNone(row.matched_at)
+            # Snapshot oförändrad
+            self.assertEqual(row.bezala_payment_merchant, "ORIGINAL")
+            self.assertEqual(row.bezala_payment_amount, 100.0)
+
+    def test_unmatch_bezala_4xx_preserves_local_state(self):
+        """C22: Bezala returnerar 422 (ej tillåtet att radera) → 502 +
+        lokal koppling bibehållen. Endast 404 är idempotent."""
+        from app.services.bezala_client import BezalaError
+
+        self._seed(
+            message_id="m-locked",
+            bezala_transaction_id="bz-locked",
+            bezala_upload_status="success",
+            matched_at=datetime.utcnow(),
+        )
+        resp, _ = self._post_unmatch(
+            "m-locked",
+            delete_side_effect=BezalaError(
+                "Bezala delete_transaction: 422",
+                status_code=422,
+                body='{"errors":["redan attesterad"]}',
+            ),
+        )
+        self.assertEqual(resp.status_code, 502)
+        with self.SessionLocal() as db:
+            row = db.query(self.ProcessedMessage).filter_by(
+                message_id="m-locked",
+            ).first()
+            self.assertEqual(row.bezala_transaction_id, "bz-locked")
 
 
 class MatchedPairsPaymentSnapshotTest(_Base):
