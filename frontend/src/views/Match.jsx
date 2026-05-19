@@ -141,6 +141,11 @@ export default function Match() {
 
   const onMatch = useCallback(
     async (msgId, missingId) => {
+      // C23 Del A — extra dubbel-klick-skydd. Knappen disables av
+      // isMatching={matchingId === s.message.id} men React-renderingen
+      // är async, så en snabb dubbel-klick kan annars trigga POSTen
+      // två gånger innan knappen hinner bli disabled.
+      if (matchingId != null) return;
       setMatchingId(msgId);
       try {
         await api.matchToBezala(msgId, missingId);
@@ -149,6 +154,25 @@ export default function Match() {
         refetch().catch(() => {});
         setActiveId(null);
       } catch (err) {
+        // C23 Del A — 409 = annan ProcessedMessage hann före (race condition).
+        // Visa informativ toast + refresha listan så användaren ser det
+        // uppdaterade tillståndet.
+        if (err instanceof ApiError && err.status === 409) {
+          const info =
+            err.body && typeof err.body === 'object' && typeof err.body.detail === 'object'
+              ? err.body.detail
+              : null;
+          const vendor = info?.existing_vendor || '';
+          toast.show({
+            kind: 'warn',
+            message: vendor
+              ? `${t.match.toast.alreadyCoupled}: ${vendor}`
+              : t.match.toast.alreadyCoupled,
+          });
+          refetch().catch(() => {});
+          setActiveId(null);
+          return;
+        }
         const detail = err instanceof ApiError ? err.message : String(err);
         toast.show({
           kind: 'err',
@@ -158,7 +182,14 @@ export default function Match() {
         setMatchingId(null);
       }
     },
-    [refetch, t.match.toast.matchFailed, t.match.toast.matched, toast],
+    [
+      matchingId,
+      refetch,
+      t.match.toast.matchFailed,
+      t.match.toast.matched,
+      t.match.toast.alreadyCoupled,
+      toast,
+    ],
   );
 
   if (isLoading) {
