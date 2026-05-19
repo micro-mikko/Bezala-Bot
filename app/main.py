@@ -3229,12 +3229,16 @@ def unmatch_receipt(
     db: Session = Depends(get_db),
     _: None = Depends(require_auth),
 ):
-    """FAS 8.5 — frikoppla ett kvitto från dess Bezala-bill_line.
+    """FAS 8.5 / C22 — frikoppla ett kvitto från dess Bezala-tx.
 
-    Rensar bezala_transaction_id + matched_at + bezala_upload_status så
-    att kvittot dyker upp som AI-förslag igen i Travel Tinder. Bezala-
-    sidan av kopplingen (filen ligger kvar bifogad till bill_line) rörs
-    INTE — användaren kan ta bort den manuellt i Bezala vid behov.
+    Steg 1: anropa Bezala DELETE /transactions/{id} så att utkastet städas
+    bort i Bezala (annars blir det orphan i "Väntar på attestering").
+    Steg 2: rensa bezala_transaction_id + matched_at + payment-snapshot
+    lokalt så att kvittot dyker upp som AI-förslag igen i Travel Tinder.
+
+    Idempotens: om Bezala svarar 404 (utkastet redan borta) → fortsätt
+    ändå med lokal rensning. Vid 5xx eller andra Bezala-fel → behåll
+    lokal koppling intakt så användaren kan försöka igen.
     """
     if not message_id or not message_id.strip():
         raise HTTPException(status_code=400, detail="message_id saknas")
@@ -3250,6 +3254,39 @@ def unmatch_receipt(
             status_code=400, detail="Meddelandet är inte kopplat",
         )
     old_tx = msg.bezala_transaction_id
+
+    # Steg 1 — radera i Bezala FÖRST. Misslyckas detta (≠ 404) avbryter vi
+    # innan lokal rensning så användaren kan retry:a.
+    try:
+        bezala = BezalaClient()
+    except BezalaError as exc:
+        logger.exception("Bezala-init misslyckades i unmatch (tx=%s)", old_tx)
+        raise HTTPException(
+            status_code=500, detail=f"Bezala-init: {exc}",
+        ) from exc
+    try:
+        delete_result = bezala.delete_transaction(old_tx)
+    except BezalaError as exc:
+        logger.error(
+            "Unmatch: Bezala DELETE /transactions/%s misslyckades — "
+            "behåller lokal koppling: %s | body=%s",
+            old_tx, exc, exc.body,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "Kunde inte radera utkastet i Bezala",
+                "bezala_status": exc.status_code,
+                "bezala_body": exc.body,
+                "local_state": "unchanged",
+            },
+        ) from exc
+    finally:
+        bezala.close()
+
+    bezala_already_gone = bool(delete_result.get("already_gone"))
+
+    # Steg 2 — rensa lokalt nu när Bezala bekräftat (eller redan saknade) utkastet.
     msg.bezala_transaction_id = None
     msg.matched_at = None
     # Återställ status så kvittot dyker upp som okopplat i suggestions
@@ -3261,10 +3298,16 @@ def unmatch_receipt(
     msg.bezala_payment_date = None
     db.commit()
     logger.info(
-        "Unmatched message_id=%s från bezala_transaction_id=%s",
-        message_id, old_tx,
+        "Unmatched message_id=%s från bezala_transaction_id=%s (bezala_already_gone=%s)",
+        message_id, old_tx, bezala_already_gone,
     )
-    return {"success": True, "message_id": message_id, "old_bezala_transaction_id": old_tx}
+    return {
+        "success": True,
+        "message_id": message_id,
+        "old_bezala_transaction_id": old_tx,
+        "bezala_deleted": True,
+        "bezala_already_gone": bezala_already_gone,
+    }
 
 
 class UploadToBezalaPayload(BaseModel):

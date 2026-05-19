@@ -613,6 +613,46 @@ class BezalaClient:
             data = {}
         return data if isinstance(data, dict) else {"_raw": data}
 
+    def delete_transaction(self, transaction_id: str | int) -> dict[str, Any]:
+        """C22 — radera ett utkast/transaktion i Bezala.
+
+        DELETE /api/transactions/{id}. Används från unmatch-endpointen så
+        att en frikoppling i Bezala Bot automatiskt städar bort orphan-
+        utkast i Bezala (tidigare beteende: lokal rensning, manuell
+        radering i Bezala UI).
+
+        Returns:
+            {"deleted": True} vid 2xx, eller
+            {"deleted": True, "already_gone": True} vid 404 (idempotent —
+            utkastet är redan borta, lokal DB kan rensas ändå).
+
+        Raises:
+            BezalaError vid andra fel (4xx ≠ 404, 5xx, nätverksfel)."""
+        if not transaction_id:
+            raise BezalaError("delete_transaction: transaction_id saknas")
+
+        path = f"/transactions/{transaction_id}"
+        logger.info("delete_transaction: DELETE %s", path)
+        resp = self._request("DELETE", path)
+
+        if resp.status_code == 404:
+            logger.warning(
+                "Bezala DELETE %s → 404 (redan raderat eller finns inte) — "
+                "idempotent, rensar lokalt ändå",
+                path,
+            )
+            return {"deleted": True, "already_gone": True}
+
+        if 200 <= resp.status_code < 300:
+            logger.info("Bezala DELETE %s → %d (raderat)", path, resp.status_code)
+            return {"deleted": True}
+
+        raise BezalaError(
+            f"Bezala delete_transaction: {resp.status_code}",
+            status_code=resp.status_code,
+            body=_safe_body_snippet(resp),
+        )
+
     # --------- Gate 0 groundwork: metadata-endpoints ---------
     #
     # Dessa läser referensdata från Bezala (konton, kostnadsställen,
