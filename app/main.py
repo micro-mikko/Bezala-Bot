@@ -2602,6 +2602,38 @@ def _do_match_to_bezala(
 
     Höjer BezalaError eller HTTPException vid fel. Caller ansvarar för
     att stänga bezala-clienten."""
+    # C23 Del A — race-condition-skydd: om någon ANNAN ProcessedMessage redan
+    # är kopplad till samma bill_line (= samma bezala_transaction_id), neka
+    # med 409 så frontend kan visa felmeddelande och refresha listan istället
+    # för att tyst skapa en duplikatkoppling. Re-match på SAMMA msg är
+    # idempotent och tillåts.
+    existing = (
+        db.query(ProcessedMessage)
+        .filter(ProcessedMessage.bezala_transaction_id == bill_line_id)
+        .filter(ProcessedMessage.id != row.id)
+        .filter(ProcessedMessage.deleted_at.is_(None))
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "bill_line_already_coupled",
+                "existing_message_id": existing.id,
+                "existing_vendor": existing.vendor,
+                "existing_amount": existing.amount,
+                "existing_currency": existing.currency,
+                "bezala_transaction_id": bill_line_id,
+                "message": (
+                    f"Bill line {bill_line_id} är redan kopplad till "
+                    f"meddelande {existing.id} "
+                    f"({existing.vendor or '—'} "
+                    f"{existing.amount if existing.amount is not None else '—'} "
+                    f"{existing.currency or ''})"
+                ).strip(),
+            },
+        )
+
     drive = _get_drive_or_401()
 
     # Snapshot bill_line-metadata FÖR attach.
@@ -2732,6 +2764,22 @@ def _do_match_to_bezala(
         credit_account_id=params.get("credit_account_id"),
         vat_lines_attributes=params.get("vat_lines_attributes") or [],
     )
+
+    # C23 Del B — efter attach + metadata-PUT hamnar Bezala-transaktionen
+    # ändå i 'reviewing' (Väntar på andras attestering) istället för
+    # 'unapproved' (Utkast). C21:s försök att skicka state="unapproved" i
+    # CREATE-formen bekräftades INTE räcka i prod-test 2026-05-19. Vi
+    # följer därför upp med POST /transactions/{tx}/return_to_draft.
+    # Best-effort: misslyckas anropet loggas warning men Couple anses
+    # lyckad — utkastet kan återkallas manuellt från attest-vyn.
+    if attach_result.transaction_id:
+        bezala.set_state_unapproved(attach_result.transaction_id)
+    else:
+        logger.info(
+            "match-to-bezala: attach_file returnerade ingen transaction_id "
+            "— hoppar över state-set (bill_line_id=%s).",
+            bill_line_id,
+        )
 
     # FAS 5.27 — Bezala har TVÅ olika ID-rymder för en kortrad-koppling:
     #   bill_line_id   = 2xxxxxx (kortraden i Bezala)

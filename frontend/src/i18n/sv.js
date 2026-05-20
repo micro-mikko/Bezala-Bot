@@ -692,6 +692,7 @@ export default {
     toast: {
       matched: 'Kvitto kopplat till Bezala-transaktionen',
       matchFailed: 'Kunde inte koppla ihop',
+      alreadyCoupled: 'Den här kortraden är redan kopplad till ett annat kvitto',
     },
   },
   travelTinder: {

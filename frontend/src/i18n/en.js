@@ -691,6 +691,7 @@ export default {
     toast: {
       matched: 'Receipt linked to the Bezala transaction',
       matchFailed: 'Could not link receipt',
+      alreadyCoupled: 'This card transaction is already coupled to another receipt',
     },
   },
   travelTinder: {

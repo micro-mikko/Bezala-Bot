@@ -882,6 +882,81 @@ class BezalaMissingReceiptsClientTest(unittest.TestCase):
         with self.assertRaises(BezalaError):
             client.attach_file("", "kvitto.pdf", PDF_BYTES)
 
+    # ---------- C23 Del B: transaction_id-exponering + set_state_unapproved ----
+
+    def test_attach_file_exposes_transaction_id_field(self):
+        """C23 Del B — BezalaAttachment.transaction_id ska bära parent-tx
+        ur attach-svaret så caller kan POSTa /transactions/{tx}/return_to_draft."""
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.text = '{"id": 999, "transaction_id": 2197448}'
+        resp.json = MagicMock(
+            return_value={"id": 999, "transaction_id": 2197448},
+        )
+        client._client.request = lambda method, url, **kw: resp
+
+        att = client.attach_file(2163467, "kvitto.pdf", PDF_BYTES)
+        self.assertEqual(att.transaction_id, "2197448")
+
+    def test_attach_file_transaction_id_is_none_when_absent(self):
+        """När Bezala-svaret saknar transaction_id sätts attributet till
+        None — caller får då hoppa över state-set-anropet."""
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.text = '{"id": 999}'
+        resp.json = MagicMock(return_value={"id": 999})
+        client._client.request = lambda method, url, **kw: resp
+
+        att = client.attach_file(2163467, "kvitto.pdf", PDF_BYTES)
+        self.assertIsNone(att.transaction_id)
+
+    def test_set_state_unapproved_posts_return_to_draft(self):
+        """C23 Del B — set_state_unapproved gör POST
+        /transactions/{id}/return_to_draft (Rails-konvention)."""
+        client = _make_client()
+        captured = {}
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.text = '{"ok": true}'
+        resp.json = MagicMock(return_value={"ok": True})
+
+        def fake_request(method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            return resp
+        client._client.request = fake_request
+
+        ok = client.set_state_unapproved(2197448)
+        self.assertTrue(ok)
+        self.assertEqual(captured["method"], "POST")
+        self.assertTrue(
+            captured["url"].endswith("/transactions/2197448/return_to_draft"),
+            captured["url"],
+        )
+
+    def test_set_state_unapproved_returns_false_on_non_2xx(self):
+        """Om return_to_draft inte finns (404/500) ska vi INTE kasta —
+        bara returnera False så Couple-flödet anses lyckat."""
+        client = _make_client()
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.headers = {"content-type": "application/json"}
+        resp.text = '{"error": "boom"}'
+        resp.json = MagicMock(return_value={"error": "boom"})
+        client._client.request = lambda method, url, **kw: resp
+
+        self.assertFalse(client.set_state_unapproved(2197448))
+
+    def test_set_state_unapproved_returns_false_for_empty_tx(self):
+        client = _make_client()
+        self.assertFalse(client.set_state_unapproved(""))
+        self.assertFalse(client.set_state_unapproved(None))
+
     def test_attach_file_with_metadata_puts_transaction_update(self):
         """FAS 5.24 — när date + credit_account_id + vat_lines skickas in
         så följs POST /attachments upp av PUT /transactions/{tx_id}."""
@@ -2101,6 +2176,115 @@ class CardMatchingEndpointsTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Drive-fil", resp.json()["detail"])
+
+    # ---- C23 Del A — 409 race-condition-skydd ----
+
+    def test_match_to_bezala_returns_409_when_bill_line_already_coupled(self):
+        """C23 Del A — om en annan ProcessedMessage redan har samma
+        bezala_transaction_id (= bill_line_id) ska anropet neka med 409
+        så frontend kan visa felmeddelande och refresha listan."""
+        coupled = self._seed_processed(
+            message_id="m-coupled",
+            file_name="20260414 ScandicHotel.pdf",
+            drive_file_id="drv-coupled",
+            vendor="Scandic",
+            amount=499.0,
+            currency="EUR",
+            bezala_transaction_id="2163467",
+            bezala_upload_status="success",
+        )
+        mid = self._seed_processed()
+
+        resp, fake_bezala = self._run_match(mid)
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        detail = resp.json()["detail"]
+        self.assertEqual(detail["error"], "bill_line_already_coupled")
+        self.assertEqual(detail["existing_message_id"], coupled)
+        self.assertEqual(detail["existing_vendor"], "Scandic")
+        self.assertEqual(detail["bezala_transaction_id"], "2163467")
+        fake_bezala.attach_file.assert_not_called()
+
+    def test_match_to_bezala_allows_rematch_on_same_message_idempotent(self):
+        """Re-Couple av samma msg till samma bill_line ska INTE blockas
+        — bara en ANNAN msg som redan tagit den triggar 409."""
+        mid = self._seed_processed(
+            bezala_transaction_id="2163467",
+            bezala_upload_status="success",
+        )
+        resp, fake_bezala = self._run_match(mid)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        fake_bezala.attach_file.assert_called_once()
+
+    def test_match_to_bezala_ignores_soft_deleted_existing_coupling(self):
+        """En soft-deleted rad med samma bezala_transaction_id ska INTE
+        blockera nya kopplingar — den är borta ur datan."""
+        from datetime import datetime as _dt
+        self._seed_processed(
+            message_id="m-deleted",
+            bezala_transaction_id="2163467",
+            bezala_upload_status="success",
+            deleted_at=_dt.utcnow(),
+            delete_reason="manual",
+        )
+        mid = self._seed_processed()
+        resp, fake_bezala = self._run_match(mid)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        fake_bezala.attach_file.assert_called_once()
+
+    # ---- C23 Del B — set_state_unapproved efter attach ----
+
+    def _run_match_with_tx(self, mid, transaction_id):
+        """Som _run_match men låter testet styra attach_result.transaction_id
+        så vi kan verifiera set_state_unapproved-anropet."""
+        fake_drive = MagicMock()
+        fake_drive.download_pdf.return_value = PDF_BYTES
+
+        fake_bezala = MagicMock()
+        fake_attachment = MagicMock()
+        fake_attachment.attachment_id = "att-1"
+        fake_attachment.transaction_id = transaction_id
+        fake_bezala.attach_file.return_value = fake_attachment
+        fake_bezala.list_missing_receipts.return_value = [
+            {
+                "id": 2163467,
+                "description": "ANTHROPIC API",
+                "amount": 112.95,
+                "currency": "EUR",
+                "date": "2026-04-14",
+            },
+        ]
+        fake_bezala.list_accounts.return_value = []
+        fake_bezala.list_cost_centers.return_value = []
+        fake_bezala.list_vat_rates.return_value = []
+
+        with patch.object(self.app_module, "DriveClient", return_value=fake_drive), \
+             patch.object(self.app_module, "BezalaClient", return_value=fake_bezala):
+            resp = self.client.post(
+                f"/api/messages/{mid}/match-to-bezala",
+                json={"missing_receipt_id": 2163467},
+            )
+        return resp, fake_bezala
+
+    def test_match_to_bezala_calls_set_state_unapproved_when_tx_returned(self):
+        """När attach_file returnerar transaction_id ska
+        set_state_unapproved kallas med samma id (best-effort)."""
+        mid = self._seed_processed()
+        resp, fake_bezala = self._run_match_with_tx(mid, "5000000")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        fake_bezala.set_state_unapproved.assert_called_once_with("5000000")
+
+    def test_match_to_bezala_skips_set_state_when_no_tx_id(self):
+        """attach_file kan returnera transaction_id=None om Bezala-svaret
+        saknade parent-tx. Då hoppas state-anropet över."""
+        mid = self._seed_processed()
+        resp, fake_bezala = self._run_match_with_tx(mid, None)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        fake_bezala.set_state_unapproved.assert_not_called()
 
     # ---- FAS 5.26 (C17) — debug-endpoint för draft-flödet ----
 
