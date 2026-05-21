@@ -220,12 +220,21 @@ export default function MatchCandidates({
     );
   }
 
+  // Bug 2 — a lone card (only AI MATCH, or only YOUR PICK) must fill the
+  // full panel width. The two-column split is reserved for when both
+  // cards are shown side by side.
+  const cardCount = (aiMessage ? 1 : 0) + (userPickMessage ? 1 : 0);
+
   return (
     <div className="tt-candidates">
       <div className="tt-section-head">
         <h3>{t.travelTinder.candidates.title}</h3>
       </div>
-      <div className="tt-candidates__grid">
+      <div
+        className={`tt-candidates__grid${
+          cardCount === 1 ? ' tt-candidates__grid--single' : ''
+        }`}
+      >
         {aiMessage ? (
           <CandidateCard
             variant="ai"
