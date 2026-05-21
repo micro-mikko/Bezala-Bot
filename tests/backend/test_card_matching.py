@@ -164,19 +164,19 @@ class ScoreMatchTest(unittest.TestCase):
 
     def test_date_distance_decay(self):
         from app.services.receipt_matcher import score_match
-        # Match algorithm 3.0 buckets (max_days, score):
-        # (3, 30), (7, 25), (14, 15), (30, 10), (60, 5), >60 → 0
-        # Same date → 30
+        # C26 buckets (max_days, score):
+        # (0, 30), (1, 28), (3, 26), (7, 25), (14, 15), (30, 10), (60, 5)
+        # Same date → 30 (exakt match — full pott)
         self.assertEqual(
             score_match(self._missing(), self._candidate())["breakdown"]["date"], 30,
         )
-        # ±1 day → 30 (i 0-3-bucketen)
+        # ±1 day → 28 (C26: tydligt lägre än exakt match)
         self.assertEqual(
-            score_match(self._missing(), self._candidate(receipt_date="2026-04-15"))["breakdown"]["date"], 30,
+            score_match(self._missing(), self._candidate(receipt_date="2026-04-15"))["breakdown"]["date"], 28,
         )
-        # ±3 days → 30 (gränsen för 0-3-bucketen)
+        # ±3 days → 26 (C26: 2-3-dagars-bucketen)
         self.assertEqual(
-            score_match(self._missing(), self._candidate(receipt_date="2026-04-17"))["breakdown"]["date"], 30,
+            score_match(self._missing(), self._candidate(receipt_date="2026-04-17"))["breakdown"]["date"], 26,
         )
         # 4-7 days → 25
         self.assertEqual(
@@ -314,7 +314,8 @@ class ScoreMatchTest(unittest.TestCase):
         )
         self.assertEqual(s["breakdown"]["date_matched_field"], "received_at")
         self.assertEqual(s["breakdown"]["date_days_off"], 1)
-        self.assertEqual(s["breakdown"]["date"], 30)
+        # C26: ±1 dag ger 28 (tidigare 30 — exakt match särskiljs nu).
+        self.assertEqual(s["breakdown"]["date"], 28)
 
     def test_moovy_case_uses_receipt_date_not_received_at(self):
         """FAS 5.12 konkret Match Health-case: Moovy-kvitto har
