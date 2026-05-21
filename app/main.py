@@ -2765,22 +2765,6 @@ def _do_match_to_bezala(
         vat_lines_attributes=params.get("vat_lines_attributes") or [],
     )
 
-    # C23 Del B — efter attach + metadata-PUT hamnar Bezala-transaktionen
-    # ändå i 'reviewing' (Väntar på andras attestering) istället för
-    # 'unapproved' (Utkast). C21:s försök att skicka state="unapproved" i
-    # CREATE-formen bekräftades INTE räcka i prod-test 2026-05-19. Vi
-    # följer därför upp med POST /transactions/{tx}/return_to_draft.
-    # Best-effort: misslyckas anropet loggas warning men Couple anses
-    # lyckad — utkastet kan återkallas manuellt från attest-vyn.
-    if attach_result.transaction_id:
-        bezala.set_state_unapproved(attach_result.transaction_id)
-    else:
-        logger.info(
-            "match-to-bezala: attach_file returnerade ingen transaction_id "
-            "— hoppar över state-set (bill_line_id=%s).",
-            bill_line_id,
-        )
-
     # FAS 5.27 — Bezala har TVÅ olika ID-rymder för en kortrad-koppling:
     #   bill_line_id   = 2xxxxxx (kortraden i Bezala)
     #   transaction_id = 5xxxxxx (draft-utlägget som filen knyts till)

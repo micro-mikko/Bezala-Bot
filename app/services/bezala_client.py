@@ -101,11 +101,6 @@ class BezalaError(RuntimeError):
 @dataclass
 class BezalaAttachment:
     attachment_id: str
-    # C23 Del B — parent-transaction-id för bill_line:n vi attach:ade till.
-    # Behövs för att efter attach kunna POSTa /transactions/{id}/return_to_draft
-    # så utkastet hamnar i 'unapproved' istället för 'reviewing'. None om
-    # Bezala-svaret inte innehöll någon transaction-koppling.
-    transaction_id: str | None = None
 
 
 @dataclass
@@ -890,59 +885,9 @@ class BezalaClient:
         # Returnera transaction_id som "attachment_id" när vi fick en — det
         # är ID:t som används för deep-link i UI och som lagras på raden.
         # Faller tillbaka på POST-svarets id / bill_line_id för bakåt-
-        # kompatibilitet när metadata inte används. C23 Del B — transaction_id
-        # exponeras även som dedikerat fält så caller kan POSTa
-        # /transactions/{tx}/return_to_draft.
+        # kompatibilitet när metadata inte används.
         effective_id = transaction_id or attachment_id
-        return BezalaAttachment(
-            attachment_id=str(effective_id),
-            transaction_id=str(transaction_id) if transaction_id else None,
-        )
-
-    def set_state_unapproved(self, transaction_id: str | int) -> bool:
-        """C23 Del B — sätt transaction-state till 'unapproved' (Utkast).
-
-        Bakgrund: efter en Couple (POST /attachments med bill_line_id) blir
-        Bezala-transaktionen automatiskt 'reviewing' (Väntar på attestering)
-        istället för 'unapproved' (Utkast). C21 testade `state=unapproved` i
-        attachment-form-datan + PUT /transactions/{id} {state: unapproved}
-        — båda misslyckades. Den mest sannolika Rails-konvention-mekanismen
-        som återstår är POST /transactions/{id}/return_to_draft (motsvarar
-        UI:s "Återkalla från attest").
-
-        Non-fatal: misslyckas anropet loggas det som warning men funktionen
-        kastar inte. Utkastet finns då i Bezala men i fel state — användaren
-        får återkalla manuellt från attest-vyn.
-
-        Returnerar True vid 2xx, False annars."""
-        if not transaction_id:
-            logger.warning(
-                "set_state_unapproved: transaction_id saknas — hoppar över."
-            )
-            return False
-        path = f"/transactions/{transaction_id}/return_to_draft"
-        logger.info("set_state_unapproved: POST %s", path)
-        try:
-            resp = self._request("POST", path)
-        except BezalaError as exc:
-            logger.warning(
-                "set_state_unapproved: misslyckades för tx %s (%s | body=%s) "
-                "— utkastet ligger kvar i 'reviewing', återkalla manuellt.",
-                transaction_id, exc, exc.body,
-            )
-            return False
-        if resp.status_code >= 400:
-            logger.warning(
-                "set_state_unapproved: tx %s svarade %s — utkastet ligger "
-                "kvar i 'reviewing'. body=%s",
-                transaction_id, resp.status_code, _safe_body_snippet(resp),
-            )
-            return False
-        logger.info(
-            "set_state_unapproved: tx %s satt till 'unapproved'.",
-            transaction_id,
-        )
-        return True
+        return BezalaAttachment(attachment_id=str(effective_id))
 
     def list_vat_rates(self) -> list[dict]:
         """Hämtar momssatser. Bezala-endpointen kan heta /vat_rates eller
