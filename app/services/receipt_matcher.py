@@ -31,8 +31,21 @@ MAX_SUGGESTIONS_PER_MISSING = 5
 # avtagande poäng.
 # Match algorithm 3.1: hård cutoff vid >365d — bortom ett år nollas hela
 # scoren oavsett andra signaler (se DATE_HARD_CUTOFF_DAYS nedan).
+#
+# C26: tidigare gav 0-3 dagars diff samma 30 poäng — en exakt datum-match
+# kunde därför inte särskiljas från ett kvitto ±1 dag fel. När belopp +
+# vendor matchade 100% blev båda kandidaterna 110p och valet godtyckligt
+# (bekräftat i prod: Skånetrafiken 14,03 € valde kvitto från fel dag).
+# Den första bucketen är nu uppdelad så exakt match (0d) > ±1d > ±2-3d.
+# OBS — Finnair-nyans: Finnair-etickets daterar avresedatum, inte
+# köpdatum, så stor datumskillnad är legitim. Därför är 4-60d-bucketarna
+# medvetet OFÖRÄNDRADE (25/15/10/5) — uppdelningen rör bara 0-3d, och den
+# skarpa datum-prioriteringen ligger i sorteringens tie-breaker
+# (find_matches) som bara triggar när två kandidater faktiskt konkurrerar.
 DATE_BUCKETS: tuple[tuple[int, int], ...] = (
-    (3, 30),
+    (0, 30),
+    (1, 28),
+    (3, 26),
     (7, 25),
     (14, 15),
     (30, 10),
@@ -416,6 +429,22 @@ def score_match(
     return result
 
 
+def _rank_key(entry: dict) -> tuple[int, int]:
+    """Sorteringsnyckel för kandidater (lägre = bättre).
+
+    C26 tie-breaker: primärt högsta score, sekundärt minst datumskillnad.
+    När två kandidater har samma vendor + belopp (vanligt: Skånetrafiken /
+    Finnair) hamnar de ofta på exakt samma totalpoäng — utan tie-breaker
+    blev valet godtyckligt (stabil sort → inmatningsordning). Nu vinner
+    alltid kandidaten närmast bankradens datum.
+
+    date_days_off kan vara None när inget datumfält fanns att jämföra —
+    de sorteras sist bland kandidater med samma score.
+    """
+    days_off = entry["score_breakdown"].get("date_days_off")
+    return (-entry["score"], days_off if days_off is not None else 10**9)
+
+
 def find_matches(
     missing: dict,
     candidates: list[dict],
@@ -423,7 +452,8 @@ def find_matches(
     rate_provider=None,
 ) -> list[dict]:
     """För ett saknat kvitto: returnera top N kandidater över tröskeln,
-    sorterat på score desc. rate_provider möjliggör cross-currency-
+    sorterat på score desc. Vid lika score avgör minst datumskillnad mot
+    bankraden (C26 tie-breaker). rate_provider möjliggör cross-currency-
     matchning (None → bara samma-valuta-jämförelser som tidigare)."""
     scored: list[dict] = []
     for cand in candidates:
@@ -437,5 +467,5 @@ def find_matches(
             if "conversion" in s:
                 entry["conversion"] = s["conversion"]
             scored.append(entry)
-    scored.sort(key=lambda x: x["score"], reverse=True)
+    scored.sort(key=_rank_key)
     return scored[:MAX_SUGGESTIONS_PER_MISSING]
