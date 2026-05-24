@@ -13,6 +13,18 @@ fi
 
 cd "${CLAUDE_PROJECT_DIR:-$(pwd)}"
 
+# Säkerställ färsk main vid session-start (fixar stale-checkout)
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [ "$CURRENT_BRANCH" = "main" ]; then
+    echo "[session-start] Pulling latest main..."
+    git pull origin main --ff-only 2>&1 || echo "[session-start] git pull failed (non-fatal, continuing)"
+  else
+    echo "[session-start] Not on main (on '$CURRENT_BRANCH') — fetching only"
+    git fetch origin 2>&1 || echo "[session-start] git fetch failed (non-fatal)"
+  fi
+fi
+
 echo "[session-start] installerar Python-deps från requirements.txt..."
 pip install --quiet -r requirements.txt
 
