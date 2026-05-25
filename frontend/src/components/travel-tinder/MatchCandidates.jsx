@@ -32,8 +32,21 @@ function CandidateCard({
         ? t.travelTinder.candidates.mergedHeader
         : t.travelTinder.candidates.userHeader;
 
+  // C30b — normalisera mot max möjlig raw-score (amount 50 + date 30 +
+  // vendor 30 = 110) så att "100 %" verkligen betyder exakt belopp +
+  // samma datum + perfekt vendor. Tidigare Math.min(100, score) klampade
+  // bort skillnaden mellan 100 och 110 → samma kvitto kunde visa 100 %
+  // mot två olika bankrader trots olika belopp-precision (rapporterat
+  // i prod 2026-05-22, Finnair 554,50 vs 534,49). Måste hållas i synk
+  // med MAX_TOTAL_SCORE i app/services/receipt_matcher.py.
+  const MAX_RAW_SCORE = 110;
   const displayScore =
-    score != null ? Math.min(100, Math.max(0, Math.round(score))) : null;
+    score != null
+      ? Math.min(
+          100,
+          Math.max(0, Math.round((score / MAX_RAW_SCORE) * 100)),
+        )
+      : null;
 
   return (
     <article

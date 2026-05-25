@@ -182,7 +182,8 @@ class MatcherCurrencyIntegrationTest(unittest.TestCase):
         self.assertEqual(r["score_breakdown"]["date"], 30)
 
     def test_same_currency_path_unchanged(self):
-        """När båda i samma valuta används ±5%-regeln med 50p."""
+        """När båda i samma valuta används ±5%-regeln. C30b: 1% diff
+        faller i 0.5-2%-bucketen → 40p (tidigare binärt 50p)."""
         from app.services.receipt_matcher import find_matches
         missing = {"amount": 100, "currency": "EUR", "date": "2026-04-22",
                    "description": "Finnair"}
@@ -191,7 +192,8 @@ class MatcherCurrencyIntegrationTest(unittest.TestCase):
         rp = MagicMock()
         results = find_matches(missing, [candidate], rate_provider=rp)
         self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["score_breakdown"]["amount"], 50)
+        # 1% diff → 0.5-2%-bucket → 40p (C30b graderad amount)
+        self.assertEqual(results[0]["score_breakdown"]["amount"], 40)
         self.assertNotIn("conversion", results[0])
         # rate_provider ska inte kallas när samma valuta matchar direkt
         rp.assert_not_called()

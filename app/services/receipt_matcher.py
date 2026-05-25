@@ -66,6 +66,14 @@ VENDOR_FLOOR_SIMILARITY = 0.20
 VENDOR_FLOOR_MAX_TOTAL = 49
 
 # Belopp-tolerans: ±5% (valutakurser + avrundning) för samma valuta.
+# C30b: scoringen är nu GRADERAD inom 5%-fönstret — se _amount_score nedan.
+# AMOUNT_BONUS är max-poäng (exakt match / avrundningsnivå); near-matches
+# inom toleransen får lägre poäng så att ett exakt belopp ALLTID rankar
+# över ett 3-4% nära-belopp för samma vendor (Finnair-fall 2026-05-22 där
+# 554,50-kvittot visade 100% mot 534,49-bankrad pga binär 50p-bonus).
+# Yttre gränsen på 5% är OFÖRÄNDRAD — utanför ger fortfarande 0p, och
+# cross-currency går genom den separata _amount_matches_via_conversion-
+# vägen som ej påverkas.
 AMOUNT_TOLERANCE = 0.05
 AMOUNT_BONUS = 50
 
@@ -79,6 +87,13 @@ AMOUNT_BONUS_CONVERTED = 40
 
 # Vendor-fuzzy: SequenceMatcher → 0..30
 VENDOR_BONUS_MAX = 30
+
+# C30b — max möjlig total raw-score: amount (50) + date (30) + vendor (30).
+# Används av frontend (via API ELLER hårdkodning) för att normalisera den
+# visade procenten så att 100 % faktiskt betyder "perfekt match" och inte
+# bara "≥100 efter klamp". Om vikterna ovan ändras måste konstanten + den
+# hårdkodade kopian i MatchCandidates.jsx (MAX_RAW_SCORE) uppdateras.
+MAX_TOTAL_SCORE = AMOUNT_BONUS + 30 + VENDOR_BONUS_MAX
 
 # Vendor-overrides: missing-receipt-beskrivning (substring) → kanonisk vendor
 # som matchas mot ProcessedMessage.vendor. Bygger med erfarenhet av Bezala-
@@ -242,6 +257,57 @@ def _amount_matches(
     return diff_pct <= AMOUNT_TOLERANCE
 
 
+def _amount_score(
+    missing_amount: float | None,
+    candidate_amount: float | None,
+) -> int:
+    """C30b — graderad belopp-poäng inom 5%-fönstret.
+
+    Trappa (vald 50/40/25/0, inte plan-defaulten 50/45/38, motivering nedan):
+      - 0–0.5  %  →  50  (exakt / avrundning)
+      - 0.5–2  %  →  40  (VAT-/avrundningsskillnad)
+      - 2–5    %  →  25  (svag belopp-signal; vendor+datum måste bära mer)
+      - > 5    %  →   0  (utanför toleransen — oförändrat)
+
+    Motivering för 50 vs 25 spread (i stället för 50 vs 38 i planen):
+    Finnair-falet 2026-05-22 (rapporterat C30):
+      bankrad O7CCY63 = 534,49 EUR 2026-05-20
+      kvitto A = 554,50 EUR (~3,74 % diff), receipt_date 2026-05-19 (1d off)
+      kvitto B = 534,49 EUR (exakt), receipt_date = flygdatum (8–60d off,
+                 Finnair etickets daterar avresedatum, ej köpdatum)
+
+    Med plan-trappa 50/45/38:
+      A: 38 + 30(vendor) + 28(1d)  = 96
+      B: 50 + 30        + 15(8-14d) = 95 — B FÖRLORAR fortfarande
+      B: 50 + 30        + 10(15-30d) = 90 — B förlorar
+
+    Med vald 50/40/25:
+      A: 25 + 30 + 28 = 83
+      B: 50 + 30 + 15 = 95 — B vinner ✓
+      B: 50 + 30 + 10 = 90 — B vinner ✓
+      B: 50 + 30 +  5 = 85 — B vinner (upp till 60d flyghorisont) ✓
+
+    Cross-currency oförändrat — den vägen går via
+    _amount_matches_via_conversion (separat 40p/0p-binär) och triggar
+    bara när valutorna skiljer. Same-currency near-matches utanför 5 %
+    får fortfarande 0 (totalförbud kvar).
+
+    Returnerar int 0..50."""
+    if missing_amount is None or candidate_amount is None:
+        return 0
+    if missing_amount == 0:
+        return 0
+    diff_pct = abs(missing_amount - candidate_amount) / abs(missing_amount)
+
+    if diff_pct <= 0.005:
+        return AMOUNT_BONUS              # 50
+    if diff_pct <= 0.02:
+        return 40
+    if diff_pct <= AMOUNT_TOLERANCE:     # 0.05
+        return 25
+    return 0
+
+
 def _amount_matches_via_conversion(
     missing_amount: float | None,
     missing_currency: str | None,
@@ -376,11 +442,19 @@ def score_match(
             "rejected_reason": "date_too_far",
         }
 
-    if _amount_matches(
-        missing.get("amount"), candidate.get("amount"),
-        missing.get("currency"), candidate.get("currency"),
-    ):
-        breakdown["amount"] = AMOUNT_BONUS
+    # C30b — same-currency: graderad amount-poäng (50/40/25/0).
+    # Different currency: gå genom konverteringsvägen (oförändrad binär
+    # 40p/0p med ±2 %-tolerans). Currency-mismatch utan rate_provider
+    # ger 0p precis som tidigare.
+    m_cur = (missing.get("currency") or "").upper().strip()
+    c_cur = (candidate.get("currency") or "").upper().strip()
+    same_or_unknown_currency = (
+        not m_cur or not c_cur or m_cur == c_cur
+    )
+    if same_or_unknown_currency:
+        breakdown["amount"] = _amount_score(
+            missing.get("amount"), candidate.get("amount"),
+        )
     elif rate_provider is not None:
         matches, converted, rate = _amount_matches_via_conversion(
             missing.get("amount"), missing.get("currency"),
