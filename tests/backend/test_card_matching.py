@@ -152,10 +152,13 @@ class ScoreMatchTest(unittest.TestCase):
         self.assertGreater(s["breakdown"]["vendor"], 20)
 
     def test_amount_within_5pct(self):
+        """C30b — graderad amount: 3.6% diff faller i 2-5%-bucketen → 25p
+        (tidigare binärt 50p). Säkrar att near-matches inte längre kan
+        slå exakta belopp i scoringen."""
         from app.services.receipt_matcher import score_match
-        # 112.95 vs 117.00 → 3.6% diff → inom 5%
+        # 112.95 vs 117.00 → 3.6% diff → 2-5%-bucket → 25p
         s = score_match(self._missing(), self._candidate(amount=117.00))
-        self.assertEqual(s["breakdown"]["amount"], 50)
+        self.assertEqual(s["breakdown"]["amount"], 25)
 
     def test_amount_outside_5pct_no_bonus(self):
         from app.services.receipt_matcher import score_match
@@ -788,6 +791,214 @@ class ScoreMatchTest(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["message"]["id"], 1)
         self.assertGreaterEqual(matches[0]["score"], MIN_DISPLAY_SCORE)
+
+
+# ---------- C30b — graderad amount-bonus ----------
+
+
+class GradedAmountScoreTest(unittest.TestCase):
+    """C30b — _amount_score-trappan: exakt belopp slår nära-belopp.
+
+    Bakgrund: bekräftat i prod 2026-05-22 visade samma 554,50-kvitto
+    100% confidence mot BÅDE O7CCY63 (534,49 EUR) och O9VAZGJ (554,50)
+    eftersom ±5%-toleransen gav binär 50p amount-bonus. Nu graderat
+    enligt 50/40/25/0 så att 0% diff > 0.5–2% diff > 2–5% diff."""
+
+    def test_amount_score_exact_match(self):
+        from app.services.receipt_matcher import _amount_score
+        self.assertEqual(_amount_score(100.0, 100.0), 50)
+
+    def test_amount_score_rounding_band_below_half_pct(self):
+        from app.services.receipt_matcher import _amount_score
+        # 0.4% diff → exakt-bucket
+        self.assertEqual(_amount_score(100.0, 100.4), 50)
+        self.assertEqual(_amount_score(100.0, 99.6), 50)
+
+    def test_amount_score_one_to_two_pct_band(self):
+        from app.services.receipt_matcher import _amount_score
+        # 1.5% diff → 40p
+        self.assertEqual(_amount_score(100.0, 101.5), 40)
+        self.assertEqual(_amount_score(100.0, 98.5), 40)
+        # gränsen 2.0% själv → 40p
+        self.assertEqual(_amount_score(100.0, 102.0), 40)
+
+    def test_amount_score_two_to_five_pct_band(self):
+        from app.services.receipt_matcher import _amount_score
+        # 3.5% diff → 25p
+        self.assertEqual(_amount_score(100.0, 103.5), 25)
+        # Finnair-fallet: 534.49 vs 554.50 = 3.74% → 2-5%-bucket
+        self.assertEqual(_amount_score(534.49, 554.50), 25)
+        # gränsen 5.0% själv → 25p
+        self.assertEqual(_amount_score(100.0, 105.0), 25)
+
+    def test_amount_score_outside_5pct_zero(self):
+        """Yttre gränsen oförändrad — >5% diff ger 0p (currency-fallback
+        / cross-currency-väg får hantera dessa fall via konvertering)."""
+        from app.services.receipt_matcher import _amount_score
+        self.assertEqual(_amount_score(100.0, 106.0), 0)
+        self.assertEqual(_amount_score(100.0, 200.0), 0)
+
+    def test_amount_score_none_or_zero(self):
+        from app.services.receipt_matcher import _amount_score
+        self.assertEqual(_amount_score(None, 100.0), 0)
+        self.assertEqual(_amount_score(100.0, None), 0)
+        self.assertEqual(_amount_score(0, 100.0), 0)
+
+
+class GradedAmountRankingTest(unittest.TestCase):
+    """C30b — exakt-belopp ska ranka över near-match för samma vendor
+    även när near-matchen har bättre datum (Finnair-fall i prod)."""
+
+    def test_exact_beats_near_amount_finnair_flight_date_8_to_14d(self):
+        """Realistiskt Finnair-fall: bankrad 2026-05-20 / 534,49 EUR.
+        Kvitto A = 554,50 EUR (3,74% diff), receipt_date 2026-05-19 (1d).
+        Kvitto B = 534,49 EUR (exakt), receipt_date 2026-05-30 (10d off,
+        Finnair-eticket daterar avresedag). B SKA vinna trots sämre
+        datum eftersom beloppet är exakt."""
+        from app.services.receipt_matcher import find_matches
+        missing = {
+            "amount": 534.49, "currency": "EUR", "date": "2026-05-20",
+            "description": "MIKKO KEINONEN: FINNAIR O7CCY63, VANTAA, FI 534.49 EUR",
+        }
+        near = {
+            "id": 1, "amount": 554.50, "currency": "EUR",
+            "receipt_date": "2026-05-19", "vendor": "Finnair",
+        }
+        exact = {
+            "id": 2, "amount": 534.49, "currency": "EUR",
+            "receipt_date": "2026-05-30", "vendor": "Finnair",
+        }
+        ranked = find_matches(missing, [near, exact])
+        self.assertEqual(ranked[0]["message"]["id"], 2)
+        self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+
+    def test_exact_beats_near_amount_finnair_flight_date_15_to_30d(self):
+        """Som ovan men receipt_date 25d bort (15-30d bucket → 10p).
+        Exakt total 50+30+10 = 90, near total 25+30+28 = 83."""
+        from app.services.receipt_matcher import find_matches
+        missing = {
+            "amount": 534.49, "currency": "EUR", "date": "2026-05-20",
+            "description": "MIKKO KEINONEN: FINNAIR O7CCY63, VANTAA, FI 534.49 EUR",
+        }
+        near = {
+            "id": 1, "amount": 554.50, "currency": "EUR",
+            "receipt_date": "2026-05-19", "vendor": "Finnair",
+        }
+        exact = {
+            "id": 2, "amount": 534.49, "currency": "EUR",
+            "receipt_date": "2026-06-14", "vendor": "Finnair",
+        }
+        ranked = find_matches(missing, [near, exact])
+        self.assertEqual(ranked[0]["message"]["id"], 2)
+
+    def test_exact_amount_beats_near_amount_same_date_vendor(self):
+        """Sanity: när datum + vendor är lika ska exakt belopp vinna
+        med stor marginal (50 vs 25)."""
+        from app.services.receipt_matcher import find_matches
+        missing = {
+            "amount": 554.50, "currency": "EUR", "date": "2026-05-13",
+            "description": "FINNAIR",
+        }
+        exact = {
+            "id": 1, "amount": 554.50, "currency": "EUR",
+            "receipt_date": "2026-05-13", "vendor": "Finnair",
+        }
+        near = {
+            "id": 2, "amount": 534.49, "currency": "EUR",
+            "receipt_date": "2026-05-13", "vendor": "Finnair",
+        }
+        ranked = find_matches(missing, [near, exact])
+        self.assertEqual(ranked[0]["message"]["id"], 1)
+        self.assertEqual(ranked[0]["score"], 110)  # 50 + 30 + 30
+        # 2-5%-bucket: 25 + 30 + 30 = 85
+        self.assertEqual(ranked[1]["score"], 85)
+
+
+class GradedAmountCrossCurrencyTest(unittest.TestCase):
+    """C30b — cross-currency-vägen ska vara helt opåverkad av graderingen.
+
+    Same-currency near-matches utanför 5% → 0p (oförändrat). Cross-currency
+    går igenom _amount_matches_via_conversion (binär 40p/0p med ±2 % tight).
+    """
+
+    def test_skanetrafiken_sek_vs_eur_still_finds_match_via_conversion(self):
+        """Regression: Skånetrafiken-flödet ska fortfarande matcha
+        SEK-kvitto mot EUR-bankrad via ECB-konvertering, oförändrat."""
+        from app.services.receipt_matcher import score_match
+
+        def rate_provider(date_str, from_c, to_c):
+            if (from_c, to_c) == ("SEK", "EUR"):
+                return 0.0951
+            return None
+
+        s = score_match(
+            {
+                "amount": 28.54, "currency": "EUR", "date": "2026-04-22",
+                "description": "SKANETRAFIKEN APP",
+            },
+            {
+                "amount": 300.0, "currency": "SEK",
+                "receipt_date": "2026-04-22",
+                "vendor": "Skånetrafiken",
+            },
+            rate_provider=rate_provider,
+        )
+        self.assertEqual(s["breakdown"]["amount"], 40)
+        self.assertIn("conversion", s)
+
+    def test_cross_currency_zero_amount_but_vendor_date_still_score(self):
+        """Cross-currency utan rate_provider → 0p på amount, men
+        vendor+datum ska fortfarande ge en icke-noll total så kandidaten
+        kan synas i UI:t (manuell match-väg)."""
+        from app.services.receipt_matcher import score_match
+        s = score_match(
+            {
+                "amount": 23.14, "currency": "EUR", "date": "2026-05-08",
+                "description": "SKANETRAFIKEN APP",
+            },
+            {
+                "amount": 245.0, "currency": "SEK",
+                "receipt_date": "2026-05-08",
+                "vendor": "Skånetrafiken",
+            },
+        )
+        self.assertEqual(s["breakdown"]["amount"], 0)
+        # vendor (alias 30) + date (exakt 30) = 60
+        self.assertGreater(s["total"], 0)
+        self.assertEqual(s["breakdown"]["vendor"], 30)
+        self.assertEqual(s["breakdown"]["date"], 30)
+
+    def test_finnair_large_date_gap_with_exact_amount_still_scores(self):
+        """Finnair flygdatum 6d bort + exakt belopp ska fortfarande
+        ranka högt (regression mot test_dual_date_prefers_receipt_date)."""
+        from app.services.receipt_matcher import score_match, MIN_DISPLAY_SCORE
+        s = score_match(
+            {
+                "amount": 366.32, "currency": "EUR", "date": "2026-04-24",
+                "description": "FINNAIR O87UJ3J",
+            },
+            {
+                "amount": 366.32, "currency": "EUR",
+                "receipt_date": "2026-04-30",
+                "vendor": "Finnair",
+            },
+        )
+        # 50 (exakt) + 25 (4-7d) + 30 (alias) = 105
+        self.assertEqual(s["breakdown"]["amount"], 50)
+        self.assertGreaterEqual(s["total"], MIN_DISPLAY_SCORE)
+
+
+class MaxTotalScoreConstantTest(unittest.TestCase):
+    """C30b — MAX_TOTAL_SCORE måste hållas i synk med vikterna; frontend
+    hårdkodar 110 i MatchCandidates.jsx + OtherReceiptsList.jsx."""
+
+    def test_max_total_score_equals_sum_of_weights(self):
+        from app.services.receipt_matcher import (
+            AMOUNT_BONUS, MAX_TOTAL_SCORE, VENDOR_BONUS_MAX,
+        )
+        # Date max är 30p (DATE_BUCKETS[0])
+        self.assertEqual(MAX_TOTAL_SCORE, AMOUNT_BONUS + 30 + VENDOR_BONUS_MAX)
+        self.assertEqual(MAX_TOTAL_SCORE, 110)
 
 
 # ---------- BezalaClient-tester ----------

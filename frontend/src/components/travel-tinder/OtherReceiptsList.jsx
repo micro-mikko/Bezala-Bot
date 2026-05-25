@@ -92,7 +92,10 @@ function ReceiptRow({ message, onClick, isAiSuggestion, isSelectedCandidate, sco
           ) : null}
           {isAiSuggestion ? (
             <span className="tt-receipt__score mono">
-              {Math.min(100, Math.max(0, Math.round(score ?? 0)))}%
+              {Math.min(
+                100,
+                Math.max(0, Math.round(((score ?? 0) / 110) * 100)),
+              )}%
             </span>
           ) : null}
         </div>
