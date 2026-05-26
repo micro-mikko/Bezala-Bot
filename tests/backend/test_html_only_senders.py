@@ -309,6 +309,72 @@ class GmailQueryBuilderTest(unittest.TestCase):
         self.assertNotIn("has:attachment", html_only)
 
 
+# ---------- C32b: Stripe-invoice-filter ----------
+
+
+class StripeInvoiceFilterTest(unittest.TestCase):
+    """C32b: BUILTIN_INCLUDES måste täcka Stripe-genererade fakturor.
+
+    Stripe skickar `invoice+statements+acct_<id>@stripe.com` för Bolt,
+    Lovable m.fl. Gmail-filtret allowlistade tidigare bara Anthropics
+    `invoice+statements@mail.anthropic.com` exakt — Stripe-varianterna
+    föll därför aldrig in i scan-queryns OR-clause och kvittona
+    processades aldrig.
+    """
+
+    def _settings(self):
+        s = MagicMock()
+        s.require_attachments = True
+        s.exclude_promotions = True
+        s.exclude_social = True
+        s.exclude_calendar = True
+        s.exclude_senders = []
+        s.exclude_subjects = []
+        s.include_senders = []
+        return s
+
+    def test_stripe_invoice_sender_in_builtins(self):
+        """C32b: Stripe-prefix måste finnas i BUILTIN_INCLUDES."""
+        from app.services.settings_service import BUILTIN_INCLUDES
+        self.assertIn("invoice+statements@stripe.com", BUILTIN_INCLUDES)
+        # Anthropic-varianten ska finnas kvar (regression)
+        self.assertIn(
+            "invoice+statements@mail.anthropic.com", BUILTIN_INCLUDES,
+        )
+
+    def test_gmail_query_includes_stripe_from_clause(self):
+        """C32b: build_gmail_query måste lägga in Stripe-prefixet i OR-clause:n.
+
+        Det är denna OR-clause som Gmail matchar avsändare mot. Utan
+        klausulen scannar pipelinen inte Bolt/Lovable-kvitton.
+        """
+        from app.services.settings_service import build_gmail_query
+        q = build_gmail_query(self._settings(), done_label="Bezala-Klar")
+        self.assertIn("from:invoice+statements@stripe.com", q)
+        # Anthropic-varianten ska FORTFARANDE finnas i samma query
+        # (vi har inte tagit bort den — bara lagt till Stripe bredvid).
+        self.assertIn("from:invoice+statements@mail.anthropic.com", q)
+
+    def test_gmail_query_keeps_promo_exclude_for_stripe(self):
+        """C32b/säkerhet: -category:promotions är kvar så Stripe-marknadsmail
+        inte fångas via det breddade filtret."""
+        from app.services.settings_service import build_gmail_query
+        q = build_gmail_query(self._settings(), done_label="Bezala-Klar")
+        self.assertIn("-category:promotions", q)
+
+    def test_gmail_query_does_not_broaden_to_all_stripe(self):
+        """C32b/säkerhet: filtret breddar INTE till `from:stripe.com` — vi
+        vill inte fånga all Stripe-trafik (kundnotiser, dispute-mail osv),
+        bara faktura-aviseringar med `invoice+statements`-prefix."""
+        from app.services.settings_service import build_gmail_query
+        q = build_gmail_query(self._settings(), done_label="Bezala-Klar")
+        # En bar `from:stripe.com` (utan local-part-prefix) får inte finnas.
+        # Vi söker efter exakt ` from:stripe.com` (whitespace före) för att
+        # inte trigga på `from:invoice+statements@stripe.com`.
+        self.assertNotIn(" from:stripe.com", q)
+        self.assertNotIn("(from:stripe.com", q)
+
+
 # ---------- Endpoint-integration ----------
 
 

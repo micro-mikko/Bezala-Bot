@@ -25,6 +25,15 @@ BUILTIN_INCLUDES: tuple[str, ...] = (
     "eticket@amadeus.com",
     "noreply@finnair.com",
     "invoice+statements@mail.anthropic.com",
+    # Stripe-genererade fakturor (Bolt/StackBlitz, Lovable, m.fl.) har
+    # alltid local-part `invoice+statements+acct_<account-id>` på
+    # stripe.com. Gmails `from:`-operator matchar prefix på local-part
+    # för icke-gmail-domäner — `from:invoice+statements@stripe.com`
+    # plockar därför både `invoice+statements+acct_1EPyda…@stripe.com`
+    # och `invoice+statements+acct_1Nu5mU…@stripe.com` utan att öppna
+    # för bredare stripe.com-trafik. `-category:promotions` ovan håller
+    # ev. marknadsutskick borta.
+    "invoice+statements@stripe.com",
     "noreply@skanetrafiken.se",
     "noreply@moovy.fi",
     "cl.seau@strawberry.se",
