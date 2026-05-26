@@ -24,16 +24,16 @@ SETTINGS_ID = 1
 BUILTIN_INCLUDES: tuple[str, ...] = (
     "eticket@amadeus.com",
     "noreply@finnair.com",
-    "invoice+statements@mail.anthropic.com",
-    # Stripe-genererade fakturor (Bolt/StackBlitz, Lovable, m.fl.) har
-    # alltid local-part `invoice+statements+acct_<account-id>` på
-    # stripe.com. Gmails `from:`-operator matchar prefix på local-part
-    # för icke-gmail-domäner — `from:invoice+statements@stripe.com`
-    # plockar därför både `invoice+statements+acct_1EPyda…@stripe.com`
-    # och `invoice+statements+acct_1Nu5mU…@stripe.com` utan att öppna
-    # för bredare stripe.com-trafik. `-category:promotions` ovan håller
-    # ev. marknadsutskick borta.
-    "invoice+statements@stripe.com",
+    # Bred prefix-match: fångar alla `invoice+statements@*`-avsändare
+    # — Anthropic (`invoice+statements@mail.anthropic.com`), Stripe-genererade
+    # fakturor (Bolt/StackBlitz: `invoice+statements+acct_1EPyda…@stripe.com`,
+    # m.fl.) samt Lovable (`invoice+statements@lovable.dev`). Gmails
+    # `from:`-operator gör substring/token-match, så en bar `from:invoice+statements`
+    # plockar in samtliga utan att öppna för bredare trafik (verifierat i prod
+    # 2026-05-26: `from:invoice+statements@stripe.com` med fullt
+    # domän-suffix matchade 0 mail, `from:invoice+statements` matchade 25).
+    # `-category:promotions` är fortsatt aktivt så ev. marknadsmail sållas bort.
+    "invoice+statements",
     "noreply@skanetrafiken.se",
     "noreply@moovy.fi",
     "cl.seau@strawberry.se",
