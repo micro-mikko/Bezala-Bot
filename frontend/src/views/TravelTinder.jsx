@@ -700,7 +700,61 @@ export default function TravelTinder() {
                 />
               ) : null
             }
-            uploadCard={<UploadCard payment={selected?.missing_receipt} />}
+            uploadCard={
+              <UploadCard
+                payment={selected?.missing_receipt}
+                onUploaded={(result) => {
+                  const coupled = result?.coupling?.ok === true;
+                  const vendor =
+                    result?.message?.vendor || result?.message?.file_name || '';
+                  if (coupled) {
+                    toast.show({
+                      kind: 'ok',
+                      message: t.travelTinder.upload.successCoupled.replace(
+                        '{vendor}',
+                        vendor,
+                      ),
+                    });
+                    // Optimistic-flagga + advance till nästa rad så
+                    // upplevelsen blir samma som vid en vanlig Couple.
+                    if (selected?.missing_receipt?.id != null) {
+                      const completedId = selected.missing_receipt.id;
+                      setCompletedPaymentIds((prev) => {
+                        const next = new Set(prev);
+                        next.add(completedId);
+                        return next;
+                      });
+                      const rawMissing = data.missing_receipts;
+                      const idx = rawMissing.findIndex(
+                        (r) => r.missing_receipt.id === completedId,
+                      );
+                      const nextRow =
+                        rawMissing
+                          .slice(idx + 1)
+                          .find(
+                            (r) =>
+                              !completedPaymentIds.has(r.missing_receipt.id),
+                          ) ||
+                        rawMissing.find(
+                          (r) =>
+                            r.missing_receipt.id !== completedId &&
+                            !completedPaymentIds.has(r.missing_receipt.id),
+                        ) ||
+                        null;
+                      setSelectedPaymentId(
+                        nextRow ? nextRow.missing_receipt.id : null,
+                      );
+                    }
+                  } else {
+                    toast.show({
+                      kind: 'ok',
+                      message: t.travelTinder.upload.success,
+                    });
+                  }
+                  refresh({ silent: true });
+                }}
+              />
+            }
             isLoading={isLoading}
           />
           ) : null}

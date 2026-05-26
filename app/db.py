@@ -50,6 +50,14 @@ _PROCESSED_MESSAGES_ADDITIONS = {
     "bezala_payment_amount": "FLOAT",
     "bezala_payment_currency": "VARCHAR(16)",
     "bezala_payment_date": "VARCHAR(32)",
+    # C33 / FAS 7a — manuell kvittouppladdning för företagskort.
+    # payment_method: 'company_card' (default) eller 'private_card' (stub
+    # tills FAS 7b/Netvisor är på plats). upload_source: 'gmail' (default)
+    # eller 'manual_upload' för rader som Mikko laddat upp via UI.
+    "payment_method": "VARCHAR(20) DEFAULT 'company_card'",
+    "upload_source": "VARCHAR(20) DEFAULT 'gmail'",
+    "manual_uploaded_at": "TIMESTAMP",
+    "manual_comment": "TEXT",
 }
 
 _APP_SETTINGS_ADDITIONS = {

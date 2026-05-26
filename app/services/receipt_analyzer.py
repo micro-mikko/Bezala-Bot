@@ -326,7 +326,16 @@ class ReceiptAnalyzer:
         if not self._client:
             raise AnalyzerError("ANTHROPIC_API_KEY saknas")
 
-        media_type = "application/pdf" if "pdf" in (mime_type or "").lower() else "application/pdf"
+        # C33 / FAS 7a — manuell upload kan ge JPG/PNG också, inte bara PDF.
+        # Anthropic API tar emot dokument (application/pdf) som "document"-
+        # blocks, men bilder (image/jpeg, image/png, image/gif, image/webp)
+        # måste skickas som "image"-blocks. Default: PDF.
+        normalized_mime = (mime_type or "").lower()
+        is_image = normalized_mime.startswith("image/")
+        if is_image:
+            media_type = normalized_mime
+        else:
+            media_type = "application/pdf"
         data_b64 = base64.b64encode(attachment_bytes).decode("ascii")
         context_date = (received_at or datetime.utcnow()).strftime("%Y-%m-%d")
         user_text = (
@@ -350,6 +359,14 @@ class ReceiptAnalyzer:
                 len(negative_examples), sender,
             )
 
+        attachment_block = {
+            "type": "image" if is_image else "document",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data_b64,
+            },
+        }
         try:
             resp = self._client.messages.create(
                 model=self._model,
@@ -359,14 +376,7 @@ class ReceiptAnalyzer:
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "document",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": data_b64,
-                                },
-                            },
+                            attachment_block,
                             {"type": "text", "text": user_text},
                         ],
                     }

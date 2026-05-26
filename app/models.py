@@ -68,6 +68,16 @@ class ProcessedMessage(Base):
     # 'needs_manual_download' tills användaren triggar /fetch-pdf.
     pending_link = Column(String(2048), nullable=True)
 
+    # C33 / FAS 7a — manuell kvittouppladdning. 'company_card' (default)
+    # går samma väg som Gmail-processade kvitton. 'private_card' är stubbad
+    # i UI:t tills FAS 7b lägger till Netvisor-routing.
+    payment_method = Column(String(20), nullable=True, default="company_card")
+    # 'gmail' = vanligt Gmail-scan-flöde. 'manual_upload' = användaren
+    # laddade upp filen via Travel Tinder upload-card.
+    upload_source = Column(String(20), nullable=True, default="gmail")
+    manual_uploaded_at = Column(DateTime, nullable=True)
+    manual_comment = Column(Text, nullable=True)
+
 
 class SavedFile(Base):
     """Unikhetsindex för filnamn + datum (tredje dubblettskiktet)."""

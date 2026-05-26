@@ -4,7 +4,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
+from fastapi import (
+    BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +35,7 @@ from app.services.pipeline import (
     reprocess_gmail_window,
     run_scan,
 )
+from app.services.pdf_validator import is_valid_pdf
 from app.services.receipt_analyzer import AnalyzerError, ReceiptAnalyzer
 from app.services.currency_converter import make_db_rate_provider
 from app.services.receipt_matcher import find_matches
@@ -1061,6 +1065,247 @@ def fetch_pdf_from_url_for_message(
     return _serialize_message(row)
 
 
+# C33 / FAS 7a — manuell kvittouppladdning för företagskort.
+# Mikko har analoga/fysiska kvitton (biltvätt, bensin, restaurang) som inte
+# finns i Gmail. Endpointen tar emot fil + valfri bill_line_id, kör samma
+# AI-analys + Drive-spar som vanliga Gmail-kvitton, och (om bill_line_id
+# angivet) gör samma coupling som /match-to-bezala. Bara 'company_card'-
+# vägen implementeras nu — 'private_card' är en stub tills FAS 7b.
+_MANUAL_UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB enligt spec
+_MANUAL_UPLOAD_ALLOWED_MIMES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+}
+_MANUAL_UPLOAD_ALLOWED_EXTS = (".pdf", ".jpg", ".jpeg", ".png")
+
+
+def _detect_mime_from_bytes(data: bytes, fallback: str) -> str:
+    """Sniffa mime från magic bytes. Drive returnerar t.ex. PNG-thumbnail
+    trots application/pdf — vi vill alltid lita på magic bytes hellre än
+    klientens content-type-header."""
+    if not data:
+        return fallback
+    if data[:4] == b"%PDF":
+        return "application/pdf"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return fallback
+
+
+@app.post("/api/messages/upload")
+async def upload_manual_receipt(
+    file: UploadFile = File(...),
+    payment_method: str = Form("company_card"),
+    comment: str | None = Form(None),
+    bill_line_id: str | None = Form(None),
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth),
+):
+    """Manuell upload av fysiskt kvitto. Endast 'company_card' implementerat
+    i FAS 7a — 'private_card' returnerar 501 tills FAS 7b/Netvisor är på
+    plats. Om bill_line_id är satt kopplas raden direkt till Bezala-kortraden
+    samma väg som /match-to-bezala."""
+    pm = (payment_method or "company_card").strip().lower()
+    if pm == "private_card":
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Privat kort är inte stödjat ännu — kommer i FAS 7b "
+                "(Netvisor-integration)."
+            ),
+        )
+    if pm != "company_card":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Okänd payment_method: {payment_method!r}",
+        )
+
+    raw_name = (file.filename or "uppladdat-kvitto").strip()
+    lower_name = raw_name.lower()
+    declared_mime = (file.content_type or "").lower()
+    if (
+        declared_mime not in _MANUAL_UPLOAD_ALLOWED_MIMES
+        and not lower_name.endswith(_MANUAL_UPLOAD_ALLOWED_EXTS)
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Endast PDF, JPG eller PNG stöds. Mottog: "
+                f"{declared_mime or raw_name}"
+            ),
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Tom fil")
+    if len(data) > _MANUAL_UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Filen är för stor ({len(data) / (1024 * 1024):.1f} MB). "
+                f"Max {_MANUAL_UPLOAD_MAX_BYTES // (1024 * 1024)} MB."
+            ),
+        )
+
+    sniffed_mime = _detect_mime_from_bytes(data, declared_mime)
+    looks_pdf_by_name = lower_name.endswith(".pdf") or declared_mime == "application/pdf"
+    if looks_pdf_by_name and not is_valid_pdf(data):
+        # Känd Drive-quirk: PDF-thumbnails kan komma som PNG trots
+        # application/pdf-header. För manuell upload är det däremot ofta
+        # ett tecken på korrupt fil — neka tydligt.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Filen är märkt som PDF men saknar %PDF-magic-bytes "
+                "(korrupt eller fel filtyp)."
+            ),
+        )
+    if sniffed_mime not in _MANUAL_UPLOAD_ALLOWED_MIMES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "Filens innehåll matchar inte en stödd typ (PDF/JPG/PNG)."
+            ),
+        )
+
+    safe_name = raw_name.replace("/", "-").replace("\\", "-")
+    if not safe_name.lower().endswith(_MANUAL_UPLOAD_ALLOWED_EXTS):
+        ext = ".pdf" if sniffed_mime == "application/pdf" else (
+            ".png" if sniffed_mime == "image/png" else ".jpg"
+        )
+        safe_name = f"{safe_name}{ext}"
+
+    # Synthesize ett message_id så processed_messages.message_id (unique)
+    # inte krockar med Gmail-ID:n. Manuella uppladdningar har inget Gmail-
+    # message — vi använder "manual:<random>" som markör.
+    synthetic_message_id = f"manual:{secrets.token_hex(8)}"
+
+    # AI-analys best-effort. Om Claude inte är konfigurerad eller misslyckas
+    # — spara ändå raden med tomma fält så Mikko kan fylla i i drawern.
+    analyzer = ReceiptAnalyzer()
+    analysis = None
+    if analyzer.enabled:
+        try:
+            analysis = analyzer.analyze(
+                attachment_bytes=data,
+                mime_type=sniffed_mime,
+                original_filename=safe_name,
+                sender="manual-upload@bezala-bot",
+                subject=comment or safe_name,
+                snippet=comment or "",
+                received_at=None,
+            )
+            if analysis.filename:
+                safe_name = analysis.filename
+        except AnalyzerError:
+            logger.exception(
+                "manual-upload: AI-analys misslyckades för %s — sparar utan AI-fält",
+                safe_name,
+            )
+
+    drive = _get_drive_or_401()
+    try:
+        upload_result = drive.upload_attachment(safe_name, data, sniffed_mime)
+    except Exception as exc:
+        logger.exception("manual-upload: Drive-upload misslyckades för %s", safe_name)
+        raise HTTPException(
+            status_code=502, detail=f"Drive-upload: {exc}",
+        ) from exc
+
+    from datetime import datetime as _dt
+    now = _dt.utcnow()
+    row = ProcessedMessage(
+        message_id=synthetic_message_id,
+        thread_id=None,
+        sender="manual-upload@bezala-bot",
+        subject=(comment or safe_name)[:1000],
+        received_at=now,
+        file_name=safe_name,
+        drive_file_id=upload_result.file_id,
+        drive_link=upload_result.web_view_link,
+        status="saved",
+        vendor=analysis.vendor if analysis else None,
+        amount=analysis.amount if analysis else None,
+        currency=analysis.currency if analysis else None,
+        receipt_date=analysis.date if analysis else None,
+        category=analysis.category if analysis else None,
+        summary=analysis.summary if analysis else None,
+        ai_description_en=analysis.description_en if analysis else None,
+        ai_confidence=analysis.confidence if analysis else None,
+        bezala_upload_status="pending",
+        payment_method="company_card",
+        upload_source="manual_upload",
+        manual_uploaded_at=now,
+        manual_comment=(comment or None),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    logger.info(
+        "manual-upload: skapade msg_id=%s file=%s (vendor=%s amount=%s)",
+        row.id, safe_name,
+        analysis.vendor if analysis else None,
+        analysis.amount if analysis else None,
+    )
+
+    coupling_result: dict | None = None
+    if bill_line_id:
+        try:
+            bezala = BezalaClient()
+        except BezalaError as exc:
+            logger.exception("manual-upload: Bezala-init misslyckades")
+            return {
+                "message": _serialize_message(row),
+                "coupling": {
+                    "ok": False,
+                    "error": f"Bezala-init: {exc}",
+                },
+            }
+        try:
+            _do_match_to_bezala(
+                row=row, bill_line_id=str(bill_line_id), db=db, bezala=bezala,
+            )
+            db.refresh(row)
+            coupling_result = {
+                "ok": True,
+                "bill_line_id": str(bill_line_id),
+                "transaction_id": row.bezala_transaction_id,
+            }
+        except HTTPException as exc:
+            coupling_result = {
+                "ok": False,
+                "status": exc.status_code,
+                "error": (
+                    exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+                ),
+            }
+        except BezalaError as exc:
+            row.bezala_upload_status = "failed"
+            row.bezala_error_message = (
+                f"{exc} | body={exc.body}" if exc.body else str(exc)
+            )[:2000]
+            db.commit()
+            db.refresh(row)
+            coupling_result = {
+                "ok": False,
+                "error": f"Bezala attach_file: {exc}",
+            }
+        finally:
+            try:
+                bezala.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return {
+        "message": _serialize_message(row),
+        "coupling": coupling_result,
+    }
+
+
 @app.post("/api/messages/{msg_id}/reprocess")
 def reprocess_message(
     msg_id: int,
@@ -1806,6 +2051,13 @@ def _serialize_message(r: ProcessedMessage) -> dict:
         "deleted_at": r.deleted_at.isoformat() if r.deleted_at else None,
         "delete_reason": r.delete_reason,
         "pending_link": r.pending_link,
+        # C33 / FAS 7a — manuell upload-metadata.
+        "payment_method": r.payment_method,
+        "upload_source": r.upload_source,
+        "manual_uploaded_at": (
+            r.manual_uploaded_at.isoformat() if r.manual_uploaded_at else None
+        ),
+        "manual_comment": r.manual_comment,
     }
 
 
