@@ -3,10 +3,15 @@
 Används av pipeline när ett mail saknar PDF-bilaga men avsändaren INTE
 ligger i link_fetch_senders — t.ex. Moovy och Skånetrafiken som lägger
 hela kvittot i mail-bodyn. Konverteras med weasyprint.
+
+C35 — image_to_pdf används av match-to-bezala-flödet för manuellt
+uppladdade JPG/PNG-kvitton som behöver bli PDF innan de skickas till
+Bezala (som bara accepterar application/pdf).
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 
 logger = logging.getLogger(__name__)
@@ -109,4 +114,67 @@ def html_to_pdf(html: str | None, *, plain_text_fallback: str | None = None) -> 
 
     if not pdf or not pdf.startswith(b"%PDF"):
         raise HtmlToPdfError("HTML→PDF returnerade inte giltig PDF.")
+    return pdf
+
+
+_IMAGE_PDF_CSS = """
+@page { size: A4; margin: 12mm; }
+body { margin: 0; padding: 0; }
+img { display: block; max-width: 100%; max-height: 100%;
+      margin: 0 auto; object-fit: contain; }
+"""
+
+
+def image_to_pdf(image_bytes: bytes, mime_type: str) -> bytes:
+    """C35 — konvertera ett JPG/PNG till en PDF som Bezala accepterar.
+
+    Manuellt uppladdade kvitton kan vara fotograferade kvitton (JPG/PNG)
+    eftersom analoga kvitton inte finns som PDF. Bezalas attach_file
+    accepterar endast application/pdf — vi bäddar därför in bilden i en
+    enkel HTML och kör samma weasyprint-pipeline som html_to_pdf.
+
+    Höjer HtmlToPdfError om bilden saknas, mime-typen är okänd eller
+    weasyprint inte kunde rendera.
+    """
+    if not image_bytes:
+        raise HtmlToPdfError("image_to_pdf: tom bild")
+    mt = (mime_type or "").lower().strip()
+    if mt == "image/jpg":
+        mt = "image/jpeg"
+    if mt not in ("image/jpeg", "image/png"):
+        raise HtmlToPdfError(
+            f"image_to_pdf: okänd mime-typ {mime_type!r} (stödjer jpeg/png)"
+        )
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    html = (
+        f"<html><body><img src=\"data:{mt};base64,{b64}\" "
+        f"alt=\"manuellt kvitto\"/></body></html>"
+    )
+
+    try:
+        from weasyprint import CSS, HTML
+    except ImportError as exc:
+        raise HtmlToPdfError(
+            "weasyprint är inte installerat — kan inte konvertera bild till PDF."
+        ) from exc
+
+    try:
+        pdf = HTML(string=html).write_pdf(
+            stylesheets=[CSS(string=_IMAGE_PDF_CSS)]
+        )
+    except Exception as exc:  # noqa: BLE001
+        runtime = _runtime_diagnostics()
+        logger.exception(
+            "image→PDF-konvertering misslyckades — exc_type=%s runtime=%s "
+            "image_bytes=%d mime=%s",
+            type(exc).__name__, runtime, len(image_bytes), mt,
+        )
+        raise HtmlToPdfError(
+            f"image→PDF kraschade ({type(exc).__name__}) pid={runtime['pid']} "
+            f"thread={runtime['thread']}: {exc}"
+        ) from exc
+
+    if not pdf or not pdf.startswith(b"%PDF"):
+        raise HtmlToPdfError("image→PDF returnerade inte giltig PDF.")
     return pdf
