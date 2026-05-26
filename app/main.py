@@ -25,7 +25,7 @@ from app.services.bezala_client import BezalaClient, BezalaError
 from app.services.bezala_field_mapper import build_receipt_params
 from app.services.drive_client import DriveClient
 from app.services.gmail_client import GmailClient
-from app.services.html_pdf_converter import HtmlToPdfError, html_to_pdf
+from app.services.html_pdf_converter import HtmlToPdfError, html_to_pdf, image_to_pdf
 from app.services.html_sanitizer import extract_links, sanitize_html
 from app.services.link_fetcher import LinkFetchError, fetch_pdf_from_link
 from app.services.pipeline import (
@@ -2840,6 +2840,60 @@ class DebugTestDraftStatusPayload(BaseModel):
     missing_receipt_id: int | str
 
 
+def _ensure_pdf_for_bezala(
+    raw_bytes: bytes,
+    *,
+    drive_file_id: str | None,
+    file_name: str | None,
+) -> tuple[bytes, str]:
+    """C35 — Bezalas attach_file kräver application/pdf. Gmail-flödet
+    levererar alltid PDF, men manuellt uppladdade kvitton (FAS 7a) kan
+    vara JPG/PNG. Detekterar bytes-typen och konverterar bilder till PDF
+    via weasyprint så coupling-vägen blir agnostisk mot kvittots ursprung.
+
+    Returnerar (pdf_bytes, file_name_for_bezala). Höjer HTTPException 502
+    om innehållet varken är PDF eller JPG/PNG (= korrupt Drive-fil)."""
+    if not raw_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Drive-nedladdning misslyckades för {drive_file_id!r}: "
+                f"0 bytes"
+            ),
+        )
+
+    if raw_bytes.startswith(b"%PDF"):
+        return raw_bytes, file_name or "kvitto.pdf"
+
+    if raw_bytes[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    else:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Drive-fil {drive_file_id!r} är varken PDF eller JPG/PNG "
+                f"(magic bytes={raw_bytes[:4]!r})"
+            ),
+        )
+
+    logger.info(
+        "match-to-bezala: konverterar %s (%d bytes) → PDF för Bezala-upload",
+        mime, len(raw_bytes),
+    )
+    try:
+        pdf_bytes = image_to_pdf(raw_bytes, mime)
+    except HtmlToPdfError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"image→PDF-konvertering misslyckades: {exc}",
+        ) from exc
+
+    base = (file_name or "kvitto").rsplit(".", 1)[0]
+    return pdf_bytes, f"{base}.pdf"
+
+
 def _do_match_to_bezala(
     *,
     row: "ProcessedMessage",
@@ -2903,17 +2957,18 @@ def _do_match_to_bezala(
             bill_line_id,
         )
 
-    pdf_bytes = drive.download_pdf(row.drive_file_id)
+    raw_bytes = drive.download_pdf(row.drive_file_id)
     logger.info(
-        "Match-to-bezala: msg_id=%s bill_line_id=%s drive_file_id=%s pdf_bytes=%d",
+        "Match-to-bezala: msg_id=%s bill_line_id=%s drive_file_id=%s "
+        "bytes=%d upload_source=%s",
         row.id, bill_line_id, row.drive_file_id,
-        len(pdf_bytes) if pdf_bytes else 0,
+        len(raw_bytes) if raw_bytes else 0, row.upload_source,
     )
-    if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
-        raise HTTPException(
-            status_code=502,
-            detail=f"PDF-nedladdning misslyckades för {row.drive_file_id!r}",
-        )
+    pdf_bytes, attach_filename = _ensure_pdf_for_bezala(
+        raw_bytes,
+        drive_file_id=row.drive_file_id,
+        file_name=row.file_name,
+    )
 
     snap = bill_line_snapshot or {}
     effective_amount = snap.get("amount") if snap.get("amount") is not None else row.amount
@@ -3010,7 +3065,7 @@ def _do_match_to_bezala(
         len(params.get("vat_lines_attributes") or []), row.sender,
     )
     attach_result = bezala.attach_file(
-        bill_line_id, row.file_name, pdf_bytes,
+        bill_line_id, attach_filename, pdf_bytes,
         description=params["description"],
         date=params["date"],
         credit_account_id=params.get("credit_account_id"),
