@@ -3983,6 +3983,161 @@ html[data-theme='B'] {
   font-size: 11.5px;
 }
 
+/* C33 / FAS 7a — funktionellt upload-kort (ersätter den disablade
+ * platshållaren när användaren ska ladda upp ett fysiskt kvitto). */
+.tt-upload-card-v2 {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tt-upload-card-v2.is-drag-active {
+  border-color: var(--accent);
+  background: var(--surface-strong, var(--surface));
+}
+
+.tt-upload-card-v2__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tt-upload-card-v2__icon {
+  font-size: 22px;
+}
+
+.tt-upload-card-v2__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.tt-upload-card-v2__input {
+  display: none;
+}
+
+.tt-upload-card-v2__drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 18px 12px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.tt-upload-card-v2__drop:hover {
+  border-color: var(--border-strong);
+}
+
+.tt-upload-card-v2__drop:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.tt-upload-card-v2__file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--surface-strong, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+}
+
+.tt-upload-card-v2__file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-upload-card-v2__method {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tt-upload-card-v2__method-label {
+  font-size: 11.5px;
+}
+
+.tt-upload-card-v2__method-toggle {
+  display: flex;
+  gap: 6px;
+}
+
+.tt-upload-card-v2__method-btn {
+  flex: 1;
+  padding: 8px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12.5px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.tt-upload-card-v2__method-btn.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft, var(--surface-strong, var(--surface)));
+  color: var(--accent-strong, var(--text));
+  font-weight: 600;
+}
+
+.tt-upload-card-v2__method-btn.is-stub {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.tt-upload-card-v2__stub-badge {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tt-upload-card-v2__comment {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tt-upload-card-v2__comment-input {
+  padding: 8px 10px;
+  background: var(--surface-strong, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.tt-upload-card-v2__submit {
+  width: 100%;
+}
+
+.tt-upload-card-v2__error {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--danger-soft, rgba(220, 80, 80, 0.12));
+  color: var(--danger, #c0392b);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+}
+
 /* ---- Modal + lightbox ---- */
 
 .tt-modal-overlay,

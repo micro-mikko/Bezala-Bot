@@ -106,6 +106,22 @@ export const api = {
       method: 'POST',
       body: { missing_receipt_id: missingReceiptId },
     }),
+  // C33 / FAS 7a — manuell upload av fysiskt kvitto. file = File-objekt.
+  // billLineId valfri — om satt kopplas raden direkt till Bezala-kortraden.
+  // paymentMethod = 'company_card' (default) eller 'private_card' (stub).
+  uploadManualReceipt: ({
+    file,
+    paymentMethod = 'company_card',
+    comment = '',
+    billLineId = null,
+  }) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('payment_method', paymentMethod);
+    if (comment) fd.append('comment', comment);
+    if (billLineId != null) fd.append('bill_line_id', String(billLineId));
+    return request('/api/messages/upload', { method: 'POST', body: fd });
+  },
   deleteErrors: () => request('/api/messages/errors', { method: 'DELETE' }),
   trashList: (limit = 200) => request(`/api/messages/trash?limit=${limit}`),
   trashCount: () => request('/api/messages/trash/count'),

@@ -91,8 +91,15 @@ class DriveClient:
         self._folder_id = settings.google_drive_folder_id
 
     def upload_pdf(self, filename: str, data: bytes) -> DriveUploadResult:
+        return self.upload_attachment(filename, data, "application/pdf")
+
+    def upload_attachment(
+        self, filename: str, data: bytes, mimetype: str
+    ) -> DriveUploadResult:
+        """Generell variant av upload_pdf — accepterar valfri mimetype.
+        Används av FAS 7a-manuell-upload som tar emot PDF/JPG/PNG."""
         media = MediaIoBaseUpload(
-            io.BytesIO(data), mimetype="application/pdf", resumable=False
+            io.BytesIO(data), mimetype=mimetype, resumable=False
         )
         metadata = {"name": filename, "parents": [self._folder_id]}
         created = (
@@ -106,7 +113,9 @@ class DriveClient:
             .execute()
         )
         file_id = created["id"]
-        logger.info("Laddade upp %s till Drive (id=%s)", filename, file_id)
+        logger.info(
+            "Laddade upp %s (%s) till Drive (id=%s)", filename, mimetype, file_id,
+        )
 
         # Lägg till "anyone with link"-läsrätt best-effort. Misslyckas det
         # (t.ex. Workspace-policy blockar) — fortsätt ändå, filen finns kvar
