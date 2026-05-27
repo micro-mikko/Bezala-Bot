@@ -415,13 +415,17 @@ class PipelineLinkFetchTest(unittest.TestCase):
             db.query(self.ProcessedMessage).delete()
             db.commit()
 
-    def test_link_fetch_sender_with_pdf_uses_pdf_not_link(self):
-        """Fix 3: Mail från link_fetch_senders MED giltig PDF-bilaga
-        ska processera PDF:en normalt (inte hoppa till link_fetch).
-        Arlanda Express 'biljett och kvitto' har båda — PDF:en räcker."""
+    def test_arlanda_with_pdf_and_link_uses_link_pdf_not_attachment(self):
+        """C37: Arlanda Express skickar BÅDE bilaga (biljett) OCH länk till
+        kvittot. Tidigare beteende (PR med C36): bilagan användes — fel,
+        biljetten saknar belopp/moms. Nytt beteende: vendor-handler hämtar
+        kvittot via länken och skriver över bilagan."""
         from app.services.gmail_client import GmailMessage, Attachment
         from app.services.pipeline import _process_one_message, ScanResult
         from app.services.drive_client import DriveUploadResult
+
+        ticket_bytes = b"%PDF-1.4\nfake-ticket"
+        receipt_bytes = b"%PDF-1.4\nfake-receipt-with-vat"
 
         msg = GmailMessage(
             message_id="link-1",
@@ -432,42 +436,52 @@ class PipelineLinkFetchTest(unittest.TestCase):
             snippet="",
             attachments=[
                 Attachment(
-                    filename="boarding.pdf",
+                    filename="biljett.pdf",
                     mime_type="application/pdf",
-                    data=b"%PDF-1.4\nfake",
+                    data=ticket_bytes,
                 )
             ],
-            body_text="Hämta kvitto: https://arlandaexpress.se/receipt/abc",
-            body_html="",
+            body_text="",
+            body_html=(
+                '<a href="https://arlandaexpress.se/kvitto/7410356-token-1234567890">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
         )
 
         fake_gmail = MagicMock()
         fake_gmail.fetch_message.return_value = msg
         fake_drive = MagicMock()
         fake_drive.upload_pdf.return_value = DriveUploadResult(
-            file_id="drv-1", web_view_link="https://drive/drv-1", name="boarding.pdf",
+            file_id="drv-1", web_view_link="https://drive/drv-1", name="kvitto.pdf",
         )
         fake_drive.filename_exists.return_value = False
         fake_namer = MagicMock()
-        fake_namer.name_for.return_value = "20260421 Arlanda Express boarding.pdf"
+        fake_namer.name_for.return_value = "20260421 Arlanda Express kvitto.pdf"
         fake_analyzer = MagicMock()
         fake_analyzer.enabled = False
 
         result = ScanResult()
-        _process_one_message(
-            "link-1",
-            fake_gmail,
-            fake_drive,
-            fake_namer,
-            fake_analyzer,
-            None,
-            result,
-            link_fetch_senders=["noreply@arlandaexpress.se"],
-        )
+        with patch(
+            "app.services.vendor_handlers.fetch_pdf_from_link",
+            return_value=receipt_bytes,
+        ):
+            _process_one_message(
+                "link-1",
+                fake_gmail,
+                fake_drive,
+                fake_namer,
+                fake_analyzer,
+                None,
+                result,
+                link_fetch_senders=["noreply@arlandaexpress.se"],
+            )
 
-        # PDF:en SKA laddas upp till Drive (link_fetch hoppas över när PDF finns)
+        # Drive SKA få länk-PDFen, inte bilagan
         fake_drive.upload_pdf.assert_called_once()
-        # Raden ska sparas som 'saved', inte 'needs_manual_download'
+        uploaded_bytes = fake_drive.upload_pdf.call_args[0][1]
+        self.assertEqual(uploaded_bytes, receipt_bytes)
+        self.assertNotEqual(uploaded_bytes, ticket_bytes)
+
         with self.SessionLocal() as db:
             row = (
                 db.query(self.ProcessedMessage)
@@ -476,8 +490,83 @@ class PipelineLinkFetchTest(unittest.TestCase):
             )
             self.assertIsNotNone(row)
             self.assertEqual(row.status, "saved")
-        # Gmail markeras klar (mark_done) eftersom PDF processades
         fake_gmail.mark_done.assert_called_once()
+
+    def test_arlanda_fallback_to_attachment_if_link_fetch_fails(self):
+        """C37: Om länk-hämtning failar (timeout, fel domän, content-type)
+        ska pipelinen falla tillbaka på bilagan — bättre att spara biljetten
+        än ingenting alls. Mikko kan reprocessa manuellt när länken funkar."""
+        from app.services.gmail_client import GmailMessage, Attachment
+        from app.services.pipeline import _process_one_message, ScanResult
+        from app.services.drive_client import DriveUploadResult
+        from app.services.link_fetcher import LinkFetchError
+
+        ticket_bytes = b"%PDF-1.4\nfake-ticket-fallback"
+        msg = GmailMessage(
+            message_id="link-fb",
+            thread_id="t-fb",
+            sender="noreply@arlandaexpress.se",
+            subject="Din resa",
+            received_at=datetime(2026, 4, 21, tzinfo=timezone.utc),
+            snippet="",
+            attachments=[
+                Attachment(
+                    filename="biljett.pdf",
+                    mime_type="application/pdf",
+                    data=ticket_bytes,
+                )
+            ],
+            body_text="",
+            body_html=(
+                '<a href="https://arlandaexpress.se/kvitto/7410356-token-1234567890">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
+        )
+
+        fake_gmail = MagicMock()
+        fake_gmail.fetch_message.return_value = msg
+        fake_drive = MagicMock()
+        fake_drive.upload_pdf.return_value = DriveUploadResult(
+            file_id="drv-fb", web_view_link="https://drive/drv-fb", name="b.pdf",
+        )
+        fake_drive.filename_exists.return_value = False
+        fake_namer = MagicMock()
+        fake_namer.name_for.return_value = "20260421 Arlanda Express.pdf"
+        fake_analyzer = MagicMock()
+        fake_analyzer.enabled = False
+
+        def raise_timeout(_url):
+            raise LinkFetchError("Timeout efter 15.0s")
+
+        result = ScanResult()
+        with patch(
+            "app.services.vendor_handlers.fetch_pdf_from_link",
+            side_effect=raise_timeout,
+        ):
+            _process_one_message(
+                "link-fb",
+                fake_gmail,
+                fake_drive,
+                fake_namer,
+                fake_analyzer,
+                None,
+                result,
+                link_fetch_senders=["noreply@arlandaexpress.se"],
+            )
+
+        # Bilagan (biljetten) används som fallback
+        fake_drive.upload_pdf.assert_called_once()
+        uploaded_bytes = fake_drive.upload_pdf.call_args[0][1]
+        self.assertEqual(uploaded_bytes, ticket_bytes)
+
+        with self.SessionLocal() as db:
+            row = (
+                db.query(self.ProcessedMessage)
+                .filter_by(message_id="link-fb")
+                .first()
+            )
+            self.assertIsNotNone(row)
+            self.assertEqual(row.status, "saved")
 
     def test_link_fetch_sender_without_pdf_uses_link(self):
         """Mail från link_fetch_senders UTAN PDF-bilaga (Mail B):
