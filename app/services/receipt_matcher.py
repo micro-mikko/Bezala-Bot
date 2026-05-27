@@ -205,6 +205,22 @@ def alias_match(
     return False
 
 
+def _vendor_primary_token(text: str) -> str | None:
+    """Plocka ut första bokstavs-baserade brand-stammen (≥ 3 tecken).
+
+    'Bolt.new'   → 'bolt'
+    'iLoq Oy'    → 'iloq'
+    'STRIPE *X'  → 'stripe'
+    'AB'         → None  (för kort)
+    """
+    if not text:
+        return None
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9]*", text):
+        if len(tok) >= 3:
+            return tok.lower()
+    return None
+
+
 def vendor_similarity(
     missing_description: str | None,
     candidate_vendor: str | None,
@@ -230,7 +246,24 @@ def vendor_similarity(
     canonical = _vendor_canonical(a)
     if canonical and canonical in b:
         return 0.95
-    return SequenceMatcher(None, a, b).ratio()
+    raw = SequenceMatcher(None, a, b).ratio()
+
+    # C36 — brand-stem boost. När kandidatens primära varumärkes-token
+    # förekommer som helt ord (word-boundary) i beskrivningen, lyft floor
+    # till 0.7. Fångar fall där kortnotans merchant-namn skiljer sig från
+    # kvittots vendor i suffix/lokalisering men brand-stammen delas:
+    #   - "MIKKO KEINONEN: BOLT.EU, TALLINN, EE ..." vs "Bolt.new"
+    #   - "MIKKO KEINONEN: APPLE.COM/BILL, ..." vs "Apple Pay Inc"
+    # 0.7 → 21p, vilket ger ett cross-currency same-day-fall (0+30+21=51)
+    # precis över MIN_DISPLAY_SCORE — ärlig låg confidence istället för
+    # att filtreras bort helt. Exact substring (1.0 → 30p) rankas
+    # fortfarande över brand-stem (0.7 → 21p), så exact-match-fall är
+    # opåverkade. Word-boundary-checken förhindrar 'bolt' från att matcha
+    # 'bolton' eller liknande prefix-kollisioner.
+    brand = _vendor_primary_token(b)
+    if brand and re.search(rf"\b{re.escape(brand)}\b", a):
+        return max(raw, 0.7)
+    return raw
 
 
 def _amount_matches(

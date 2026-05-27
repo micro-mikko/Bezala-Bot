@@ -1001,6 +1001,127 @@ class MaxTotalScoreConstantTest(unittest.TestCase):
         self.assertEqual(MAX_TOTAL_SCORE, 110)
 
 
+# ---------- C36 — brand-stem fuzzy för cross-currency ----------
+
+
+class BrandStemFuzzyMatchTest(unittest.TestCase):
+    """C36 — när kvittots vendor delar brand-stam med kortnotans description
+    (men exakt substring missar pga olika suffix/lokalisering: Bolt.new vs
+    BOLT.EU), ska vendor-similarity falla på 0.7 så cross-currency-fallet
+    klarar MIN_DISPLAY_SCORE som svag kandidat. Exact match (1.0) rankas
+    fortfarande över brand-stem (0.7)."""
+
+    def test_bolt_new_usd_matches_bolt_eur_card_line(self):
+        """Bolt.new USD-kvitto ska föreslås mot Bolt-bankrad samma datum
+        (cross-currency utan rate_provider → amount=0, men vendor+datum
+        ska bära ~50%+ confidence)."""
+        from app.services.receipt_matcher import (
+            find_matches, score_match, MIN_DISPLAY_SCORE,
+        )
+        bill = {
+            "amount": 22.06, "currency": "EUR", "date": "2026-05-16",
+            "description": (
+                "MIKKO KEINONEN: BOLT.EU, TALLINN, EE 22.06 EUR"
+            ),
+        }
+        receipt = {
+            "id": 42, "amount": 25.00, "currency": "USD",
+            "receipt_date": "2026-05-16", "vendor": "Bolt.new",
+        }
+        s = score_match(bill, receipt)
+        # vendor brand-stem 'bolt' i description → 0.7 → 21p
+        self.assertEqual(s["breakdown"]["vendor"], 21)
+        # amount=0 (cross-currency utan rate), date=30 (exakt), vendor=21
+        self.assertEqual(s["total"], 51)
+        self.assertGreaterEqual(s["total"], MIN_DISPLAY_SCORE)
+        # Och: find_matches släpper igenom kandidaten
+        matches = find_matches(bill, [receipt])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["message"]["id"], 42)
+
+    def test_bolt_short_description_still_works(self):
+        """Bankrad med kort description ('BOLT') ska fortfarande matcha
+        Bolt.new via existerande substring-väg (sim=1.0)."""
+        from app.services.receipt_matcher import vendor_similarity
+        self.assertEqual(vendor_similarity("BOLT", "Bolt.new"), 1.0)
+        self.assertEqual(vendor_similarity("Bolt", "Bolt.new"), 1.0)
+
+    def test_brand_stem_word_boundary_blocks_prefix_collision(self):
+        """'bolt' brand-stem får INTE matcha 'bolton' (word-boundary)."""
+        from app.services.receipt_matcher import vendor_similarity
+        sim = vendor_similarity("BOLTON CINEMAS, UK", "Bolt.new")
+        # SequenceMatcher returnerar låg ratio, brand-stem blockeras av
+        # \b → ingen boost till 0.7.
+        self.assertLess(sim, 0.5)
+
+    def test_brand_stem_does_not_lower_existing_match(self):
+        """Om SequenceMatcher redan ger > 0.7 (t.ex. APPLE vs Apple Inc)
+        ska brand-stem-floor inte sänka. max(raw, 0.7) bevarar högre värde."""
+        from app.services.receipt_matcher import vendor_similarity
+        # 'apple' brand i båda, raw ratio är ~0.78
+        sim = vendor_similarity("APPLE", "Apple Inc")
+        # b in a eller a in b → 1.0 (men det är via substring, inte brand-stem)
+        self.assertEqual(sim, 1.0)
+
+    def test_hertz_anthropic_false_positive_still_blocked(self):
+        """Bug #5 regression: HERTZ SVERIGE vs Anthropic ska FORTFARANDE
+        kapas under tröskel. Anthropic brand-stem ('anthropic') finns inte
+        i Hertz-description → ingen brand-stem-boost → floor kapar."""
+        from app.services.receipt_matcher import score_match
+        s = score_match(
+            {
+                "amount": 108.92, "currency": "EUR", "date": "2026-04-14",
+                "description": (
+                    "MIKKO KEINONEN: HERTZ SVERIGE, STOCKHOLM, "
+                    "SE 108.92 EUR"
+                ),
+            },
+            {
+                "amount": 112.95, "currency": "EUR",
+                "receipt_date": "2026-04-20", "vendor": "Anthropic",
+            },
+        )
+        self.assertLessEqual(s["total"], 49)
+
+    def test_exact_match_ranks_above_brand_stem_cross_currency(self):
+        """Två kandidater för samma bankrad:
+        A) exakt match (samma valuta, exakt belopp+datum+vendor)
+        B) cross-currency brand-stem (annan valuta, brand delas)
+        A ska ranka över B trots båda i sviting."""
+        from app.services.receipt_matcher import find_matches
+        bill = {
+            "amount": 22.06, "currency": "EUR", "date": "2026-05-16",
+            "description": (
+                "MIKKO KEINONEN: BOLT.EU, TALLINN, EE 22.06 EUR"
+            ),
+        }
+        exact = {
+            "id": 1, "amount": 22.06, "currency": "EUR",
+            "receipt_date": "2026-05-16", "vendor": "Bolt",
+        }
+        cross = {
+            "id": 2, "amount": 25.00, "currency": "USD",
+            "receipt_date": "2026-05-16", "vendor": "Bolt.new",
+        }
+        matches = find_matches(bill, [exact, cross])
+        self.assertEqual(len(matches), 2)
+        # A (exakt) ska komma först
+        self.assertEqual(matches[0]["message"]["id"], 1)
+        self.assertEqual(matches[1]["message"]["id"], 2)
+        self.assertGreater(matches[0]["score"], matches[1]["score"])
+
+    def test_vendor_primary_token_extraction(self):
+        """Helper: _vendor_primary_token returnerar första bokstavs-token
+        ≥ 3 tecken, lowercase."""
+        from app.services.receipt_matcher import _vendor_primary_token
+        self.assertEqual(_vendor_primary_token("Bolt.new"), "bolt")
+        self.assertEqual(_vendor_primary_token("iLoq Oy"), "iloq")
+        self.assertEqual(_vendor_primary_token("STRIPE *X"), "stripe")
+        self.assertEqual(_vendor_primary_token("AB"), None)
+        self.assertEqual(_vendor_primary_token(""), None)
+        self.assertEqual(_vendor_primary_token(None), None)
+
+
 # ---------- BezalaClient-tester ----------
 
 
