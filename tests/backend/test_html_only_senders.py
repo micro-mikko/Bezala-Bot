@@ -345,11 +345,25 @@ class StripeInvoiceFilterTest(unittest.TestCase):
         self.assertIn("invoice+statements", BUILTIN_INCLUDES)
 
     def test_gmail_query_includes_invoice_statements_clause(self):
-        """C32b: build_gmail_query måste lägga in `from:invoice+statements`
-        i OR-clause:n. Det är denna OR-clause Gmail matchar avsändare mot."""
+        """C32b: build_gmail_query måste lägga in `from:"invoice+statements"`
+        i OR-clause:n. Citationstecken krävs eftersom Gmail bryter OR-parsning
+        när `+`-tecknet förekommer i en oquoted `from:`-värde (verifierat i
+        prod 2026-05-26: `(from:x OR from:invoice+statements)` → 0 träffar;
+        `(from:x OR from:"invoice+statements")` → korrekt antal)."""
         from app.services.settings_service import build_gmail_query
         q = build_gmail_query(self._settings(), done_label="Bezala-Klar")
-        self.assertIn("from:invoice+statements", q)
+        # Måste vara quoted för att överleva OR-clause:n.
+        self.assertIn('from:"invoice+statements"', q)
+        # UN-quoted version får INTE finnas direkt — Gmail bryter OR då.
+        # Sök efter exakt `from:invoice+statements` (utan citat) som inte
+        # följs av citattecken. Splittar på " och kollar att ingen del
+        # innehåller bar `from:invoice+statements`.
+        # Enklare: kontrollera att querysträngen INTE har varianten
+        # `OR from:invoice+statements` eller `(from:invoice+statements`
+        # utan citat. (Quoten ligger som `from:"invoice+statements"`.)
+        self.assertNotIn(" from:invoice+statements ", " " + q + " ")
+        self.assertNotIn("(from:invoice+statements ", q)
+        self.assertNotIn("(from:invoice+statements)", q)
 
     def test_gmail_query_keeps_promo_exclude(self):
         """C32b/säkerhet: -category:promotions är kvar så marknadsmail
@@ -367,6 +381,25 @@ class StripeInvoiceFilterTest(unittest.TestCase):
         # En bar `from:stripe.com` (utan local-part-prefix) får inte finnas.
         self.assertNotIn(" from:stripe.com", q)
         self.assertNotIn("(from:stripe.com", q)
+
+    def test_plus_sender_gets_quoted_in_or_clause(self):
+        """C32b regression: alla `from:`-värden som innehåller `+`-tecken
+        måste citeras i OR-clause:n. Annars bryts Gmails OR-parsing och
+        ANDRA villkor i samma OR-clause matchar 0 (root-cause för att
+        Arlanda Express-mail föll bort efter C32b first-pass).
+        """
+        from app.services.settings_service import build_gmail_query
+        s = self._settings()
+        # Lägg till en user-include med `+` så vi täcker bägge banorna
+        # (BUILTIN och user-includes).
+        s.include_senders = ["receipts+sub@example.com"]
+        q = build_gmail_query(s, done_label="Bezala-Klar")
+        self.assertIn('from:"receipts+sub@example.com"', q)
+        self.assertIn('from:"invoice+statements"', q)
+        # Avsändare UTAN `+` ska INTE quotas (för att inte bryta befintliga
+        # query-mönster i onödan).
+        self.assertIn("from:noreply@arlandaexpress.se", q)
+        self.assertNotIn('from:"noreply@arlandaexpress.se"', q)
 
     def test_no_redundant_invoice_statements_entries(self):
         """C32b: vi har konsoliderat till en enda bred entry. Tidigare

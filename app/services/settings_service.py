@@ -122,6 +122,17 @@ def _clean_list(items: Iterable[str] | None) -> list[str]:
     return [s.strip() for s in (items or []) if s and s.strip()]
 
 
+def _format_from_clause(sender: str) -> str:
+    """Bygg `from:<sender>`-klausul. Wrappar med citationstecken om sender
+    innehåller `+` — Gmails query-parser bryter OR-clause:r när `+`-tecknet
+    förekommer i bara local-part (verifierat i prod 2026-05-26 via
+    /api/gmail/peek: `(from:noreply@x.se OR from:invoice+statements)` →
+    0 träffar; `(from:noreply@x.se OR from:"invoice+statements")` → 2)."""
+    if "+" in sender:
+        return f'from:"{sender}"'
+    return f"from:{sender}"
+
+
 def build_gmail_query(
     row: AppSettings,
     done_label: str,
@@ -183,13 +194,13 @@ def build_gmail_query(
         or_parts: list[str] = []
         dropped: list[str] = []
         for i, s in enumerate(all_includes):
-            candidate = or_parts + [f"from:{s}"]
+            candidate = or_parts + [_format_from_clause(s)]
             clause = "(" + " OR ".join(candidate) + ")"
             if base_len + 1 + len(clause) > GMAIL_QUERY_SOFT_LIMIT:
                 # Släpp resten (som är user-chips eftersom builtins kommer först)
                 dropped = all_includes[i:]
                 break
-            or_parts.append(f"from:{s}")
+            or_parts.append(_format_from_clause(s))
         if or_parts:
             parts.append("(" + " OR ".join(or_parts) + ")")
         if dropped:
@@ -256,12 +267,12 @@ def build_gmail_query_html_only(
     or_parts: list[str] = []
     dropped: list[str] = []
     for i, s in enumerate(patterns):
-        candidate = or_parts + [f"from:{s}"]
+        candidate = or_parts + [_format_from_clause(s)]
         clause = "(" + " OR ".join(candidate) + ")"
         if base_len + 1 + len(clause) > GMAIL_QUERY_SOFT_LIMIT:
             dropped = patterns[i:]
             break
-        or_parts.append(f"from:{s}")
+        or_parts.append(_format_from_clause(s))
     if not or_parts:
         return None
     parts.append("(" + " OR ".join(or_parts) + ")")
