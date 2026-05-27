@@ -44,22 +44,29 @@ class LinkReceiptHandler:
     """En vendor vars länk-PDF ska användas istället för mail-bilagan.
 
     sender_substring: case-insensitive substring som matchas mot msg.sender
-    allowed_domain_suffix: FINAL URL (efter följda redirects) måste peka
-        mot denna domän eller en subdomän — annars rejectar vi PDFen.
-        Entry-URLen får vara vad som helst som är HTTPS (click-trackers
-        som SendGrid är normalt för transaktionsmail).
+    allowed_domain_suffixes: FINAL URL (efter följda redirects) måste peka
+        mot någon av dessa domäner eller en subdomän — annars rejectar vi
+        PDFen. Entry-URLen får vara vad som helst som är HTTPS (click-
+        trackers som SendGrid är normalt för transaktionsmail). Tuple för
+        att vendor-företag ibland hostar kvitton på operatör-domän (t.ex.
+        Arlanda Express → A-Train AB → atrain.se).
     """
     name: str
     sender_substring: str
-    allowed_domain_suffix: str
+    allowed_domain_suffixes: tuple[str, ...]
 
 
 # Registry. Lägg till fler entries här när nya vendors identifierats.
+#
+# Arlanda Express drivs av A-Train AB — mailen kommer från
+# noreply@arlandaexpress.se men kvitto-PDFer hostas på api.atrain.se
+# (verifierat i prod 2026-05-27: SendGrid-redirect landar där). Båda
+# domänerna allowlistas så final-URL-checken accepterar atrain-PDFer.
 _HANDLERS: tuple[LinkReceiptHandler, ...] = (
     LinkReceiptHandler(
         name="Arlanda Express",
         sender_substring="@arlandaexpress.se",
-        allowed_domain_suffix="arlandaexpress.se",
+        allowed_domain_suffixes=("arlandaexpress.se", "atrain.se"),
     ),
 )
 
@@ -84,15 +91,19 @@ def _is_https(url: str) -> bool:
     return parsed.scheme == "https"
 
 
-def _host_matches_suffix(url: str, allowed_suffix: str) -> bool:
-    """True om hostnamnet är exakt allowed_suffix eller en sub-domän."""
+def _host_matches_any_suffix(url: str, allowed_suffixes: tuple[str, ...]) -> bool:
+    """True om hostnamnet är exakt någon allowed_suffix eller en sub-domän
+    av någon. Tom tuple → alltid False."""
     try:
         parsed = urlparse(url)
     except Exception:  # noqa: BLE001
         return False
     host = (parsed.hostname or "").lower()
-    suffix = allowed_suffix.lower()
-    return host == suffix or host.endswith("." + suffix)
+    for suffix in allowed_suffixes:
+        s = suffix.lower()
+        if host == s or host.endswith("." + s):
+            return True
+    return False
 
 
 def fetch_link_receipt_for_message(
@@ -164,11 +175,11 @@ def fetch_link_receipt_for_message(
         )
         return None
 
-    if not _host_matches_suffix(final_url, handler.allowed_domain_suffix):
+    if not _host_matches_any_suffix(final_url, handler.allowed_domain_suffixes):
         logger.warning(
-            "vendor_handler %s: final URL %r matchar inte tillåten domän "
+            "vendor_handler %s: final URL %r matchar ingen tillåten domän "
             "%s (entry var %r) — rejectar och faller tillbaka på bilaga",
-            handler.name, final_url, handler.allowed_domain_suffix, url,
+            handler.name, final_url, handler.allowed_domain_suffixes, url,
         )
         return None
 

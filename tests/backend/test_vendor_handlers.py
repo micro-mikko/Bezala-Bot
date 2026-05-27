@@ -88,6 +88,29 @@ class ArlandaExpressLinkReceiptTest(unittest.TestCase):
         result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
         self.assertEqual(result, fake_pdf)
 
+    def test_sendgrid_wrapped_url_lands_on_atrain_se_accepted(self):
+        """C37c: Arlanda Express drivs av A-Train AB — verkliga prod-PDFen
+        hostas på api.atrain.se efter SendGrid-redirect. Båda domänerna
+        ska vara allowlistade för Arlanda-handlern."""
+        from app.services.vendor_handlers import fetch_link_receipt_for_message
+
+        msg = _make_msg(
+            body_html=(
+                '<a href="https://u10665393.ct.sendgrid.net/ls/click?abc-very-long-token-xyz">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
+        )
+        fake_pdf = b"%PDF-1.4\natrain-receipt"
+        fetcher = _make_fetcher(
+            pdf=fake_pdf,
+            final_url=(
+                "https://api.atrain.se/mypages/sync/v1/tickets-by-order/"
+                "7410356/pdf?lang=sv-SE&syncToken=B0DDA987"
+            ),
+        )
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
+        self.assertEqual(result, fake_pdf)
+
     def test_sendgrid_wrapped_entry_url_rejected_when_final_url_is_other_domain(self):
         """C37b säkerhet: om någon hijackar SendGrid-kontot och pekar
         redirect mot evil.com → final URL ≠ arlandaexpress.se → rejecta."""
