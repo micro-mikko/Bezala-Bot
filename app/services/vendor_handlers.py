@@ -11,8 +11,13 @@ kvittot via länken och använder den PDF:en istället för bilagan.
 Vi går med vendor-SPECIFIKA handlers, inte en generell heuristik som
 "om bodyn innehåller 'kvitto' + länk → hämta". Det är säkrare:
 
-  - Vi validerar att länken pekar mot samma domän som avsändaren
-    (skydd mot manipulerade kvitto-länkar i mail-bodyn)
+  - Vi validerar att FINAL URL (efter följda redirects) pekar mot
+    vendor-domänen — skydd mot manipulerade kvitto-länkar i mail-bodyn
+    OCH mot hijackade redirector-konton (om någon stjäl Arlandas
+    SendGrid-konto och pekar redirect mot evil.com → final URL ≠
+    arlandaexpress.se → vi rejectar)
+  - Entry-URLen får vara en click-tracker (SendGrid, Mailgun, etc.) —
+    avsändarna använder dem för bounce/open-spårning, kan inte skippas
   - Falskpositiva i en allmän heuristik kan dra in fel länkar
     (avbokningssidor, "betala igen"-länkar, etc.)
 
@@ -39,9 +44,10 @@ class LinkReceiptHandler:
     """En vendor vars länk-PDF ska användas istället för mail-bilagan.
 
     sender_substring: case-insensitive substring som matchas mot msg.sender
-    allowed_domain_suffix: kvitto-länken måste peka mot denna domän (eller
-        en subdomän) — annars hoppas vi. Skydd mot phishing-länkar i
-        kapade mail.
+    allowed_domain_suffix: FINAL URL (efter följda redirects) måste peka
+        mot denna domän eller en subdomän — annars rejectar vi PDFen.
+        Entry-URLen får vara vad som helst som är HTTPS (click-trackers
+        som SendGrid är normalt för transaktionsmail).
     """
     name: str
     sender_substring: str
@@ -68,16 +74,21 @@ def _find_handler(sender: str | None) -> LinkReceiptHandler | None:
     return None
 
 
-def _link_matches_allowed_domain(url: str, allowed_suffix: str) -> bool:
-    """True om URL:en är HTTPS och hostnamnet är exakt allowed_suffix
-    eller en sub-domän av den. http:// avvisas alltid (kvitton går över TLS)."""
+def _is_https(url: str) -> bool:
     if not url:
         return False
     try:
         parsed = urlparse(url)
     except Exception:  # noqa: BLE001
         return False
-    if parsed.scheme != "https":
+    return parsed.scheme == "https"
+
+
+def _host_matches_suffix(url: str, allowed_suffix: str) -> bool:
+    """True om hostnamnet är exakt allowed_suffix eller en sub-domän."""
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
         return False
     host = (parsed.hostname or "").lower()
     suffix = allowed_suffix.lower()
@@ -87,21 +98,23 @@ def _link_matches_allowed_domain(url: str, allowed_suffix: str) -> bool:
 def fetch_link_receipt_for_message(
     msg: GmailMessage,
     *,
-    _fetcher: Callable[[str], bytes] | None = None,
+    _fetcher: Callable[[str], tuple[bytes, str]] | None = None,
 ) -> bytes | None:
     """Returnera PDF-bytes från en vendor-specifik kvitto-länk om handler
     matchar och hämtning lyckas. Returnerar None i alla andra fall:
 
       - Avsändaren matchar ingen handler
       - Ingen kvitto-länk hittades i mail-bodyn
-      - Länken pekar mot en oväntad domän (säkerhetsskydd)
+      - Entry-URLen är inte HTTPS (kvitton går alltid över TLS)
       - HTTP-hämtning failade (timeout, 404, content-type, magic bytes)
+      - FINAL URL (efter följda redirects) är inte HTTPS, eller pekar mot
+        en oväntad domän — skydd mot hijackade click-trackers
 
     Pipelinen ska då falla tillbaka på den vanliga bilage-baserade vägen
     — bilagan är inte rätt underlag, men bättre än ingen logg alls.
 
     `_fetcher` är en injection-point för tester — anropas med URL,
-    returnerar PDF-bytes eller raisar LinkFetchError.
+    returnerar (pdf_bytes, final_url) eller raisar LinkFetchError.
     """
     handler = _find_handler(msg.sender)
     if handler is None:
@@ -116,17 +129,18 @@ def fetch_link_receipt_for_message(
         )
         return None
 
-    if not _link_matches_allowed_domain(url, handler.allowed_domain_suffix):
+    # Entry-URL: tillåt vilken HTTPS-domän som helst (SendGrid/Mailgun
+    # click-trackers är normalt). Final-URL valideras efter fetch.
+    if not _is_https(url):
         logger.warning(
-            "vendor_handler %s: länk %r matchar inte tillåten domän %s — "
-            "ignoreras (möjligen phishing eller fel-extraherad länk)",
-            handler.name, url, handler.allowed_domain_suffix,
+            "vendor_handler %s: entry-länk %r är inte HTTPS — ignoreras",
+            handler.name, url,
         )
         return None
 
     fetcher = _fetcher if _fetcher is not None else fetch_pdf_from_link
     try:
-        pdf_bytes = fetcher(url)
+        pdf_bytes, final_url = fetcher(url)
     except LinkFetchError as exc:
         logger.warning(
             "vendor_handler %s: hämtning av %s failade (%s) — "
@@ -142,9 +156,25 @@ def fetch_link_receipt_for_message(
         )
         return None
 
+    if not _is_https(final_url):
+        logger.warning(
+            "vendor_handler %s: redirect-kedjan landade på icke-HTTPS URL "
+            "%r — rejectar (möjlig downgrade-attack)",
+            handler.name, final_url,
+        )
+        return None
+
+    if not _host_matches_suffix(final_url, handler.allowed_domain_suffix):
+        logger.warning(
+            "vendor_handler %s: final URL %r matchar inte tillåten domän "
+            "%s (entry var %r) — rejectar och faller tillbaka på bilaga",
+            handler.name, final_url, handler.allowed_domain_suffix, url,
+        )
+        return None
+
     logger.info(
-        "vendor_handler %s: använder länk-kvitto från %s (%d bytes) "
-        "istället för mail-bilaga för %s",
-        handler.name, url, len(pdf_bytes), msg.message_id,
+        "vendor_handler %s: använder länk-kvitto från %s (final=%s, "
+        "%d bytes) istället för mail-bilaga för %s",
+        handler.name, url, final_url, len(pdf_bytes), msg.message_id,
     )
     return pdf_bytes

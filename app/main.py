@@ -916,8 +916,11 @@ def restore_message(
 
 
 def _fetch_pdf_helper(url: str) -> bytes:
-    """Wrapper som finns som funktion för att kunna mockas i tester."""
-    return fetch_pdf_from_link(url)
+    """Wrapper som finns som funktion för att kunna mockas i tester.
+    Returnerar bara bytes — final_url ignoreras eftersom användar-triggade
+    /fetch-pdf-endpoints alltid får en specifik URL från användaren."""
+    pdf_bytes, _final_url = fetch_pdf_from_link(url)
+    return pdf_bytes
 
 
 @app.get("/api/messages/{msg_id}/body")

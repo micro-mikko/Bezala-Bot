@@ -1,9 +1,10 @@
-"""Tester för vendor-specifika kvitto-hämtare (C37).
+"""Tester för vendor-specifika kvitto-hämtare (C37 + C37b).
 
 Täcker:
 - Arlanda Express: hämtar kvitto från länk i mail-bodyn
+- SendGrid-wrappade entry-URLer accepteras; final URL valideras post-fetch
 - Fallback: returnerar None om hämtning failar (pipelinen faller på bilaga)
-- Säkerhet: länk måste vara HTTPS + matcha tillåten domän
+- Säkerhet: HTTPS på entry OCH final URL; final URL måste matcha vendor-domän
 - Avsändare utan handler returnerar None
 """
 
@@ -38,8 +39,16 @@ def _make_msg(
     )
 
 
+def _make_fetcher(*, pdf: bytes = b"%PDF-1.4\nok", final_url: str):
+    """Fake-fetcher som returnerar (pdf_bytes, final_url) — matchar nya
+    signaturen för fetch_pdf_from_link efter C37b."""
+    def _f(_url):
+        return pdf, final_url
+    return _f
+
+
 class ArlandaExpressLinkReceiptTest(unittest.TestCase):
-    def test_fetches_pdf_when_sender_matches_and_link_present(self):
+    def test_fetches_pdf_when_sender_matches_and_final_url_on_vendor_domain(self):
         from app.services.vendor_handlers import fetch_link_receipt_for_message
 
         msg = _make_msg(
@@ -53,21 +62,90 @@ class ArlandaExpressLinkReceiptTest(unittest.TestCase):
 
         def fake_fetcher(url):
             called_with["url"] = url
-            return fake_pdf
+            return fake_pdf, "https://www.arlandaexpress.se/kvitto/7410356.pdf"
 
         result = fetch_link_receipt_for_message(msg, _fetcher=fake_fetcher)
         self.assertEqual(result, fake_pdf)
         self.assertIn("arlandaexpress.se", called_with["url"])
-        self.assertIn("kvitto", called_with["url"])
+
+    def test_sendgrid_wrapped_entry_url_accepted_when_final_url_matches_vendor(self):
+        """C37b: Arlandas mail går genom SendGrid click-tracker. Entry-URLen
+        är u10665393.ct.sendgrid.net/... — får INTE rejectas. Det är FINAL
+        URL efter följda redirects som måste matcha arlandaexpress.se."""
+        from app.services.vendor_handlers import fetch_link_receipt_for_message
+
+        msg = _make_msg(
+            body_html=(
+                '<a href="https://u10665393.ct.sendgrid.net/ls/click?abc-very-long-token-xyz">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
+        )
+        fake_pdf = b"%PDF-1.4\nreal-receipt"
+        fetcher = _make_fetcher(
+            pdf=fake_pdf,
+            final_url="https://www.arlandaexpress.se/kvitto/7410356.pdf",
+        )
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
+        self.assertEqual(result, fake_pdf)
+
+    def test_sendgrid_wrapped_entry_url_rejected_when_final_url_is_other_domain(self):
+        """C37b säkerhet: om någon hijackar SendGrid-kontot och pekar
+        redirect mot evil.com → final URL ≠ arlandaexpress.se → rejecta."""
+        from app.services.vendor_handlers import fetch_link_receipt_for_message
+
+        msg = _make_msg(
+            body_html=(
+                '<a href="https://u10665393.ct.sendgrid.net/ls/click?abc-very-long-token-xyz">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
+        )
+        fetcher = _make_fetcher(final_url="https://evil.com/fake-receipt.pdf")
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
+        self.assertIsNone(result)
+
+    def test_rejects_when_final_url_downgrades_to_http(self):
+        """C37b säkerhet: om redirect-kedjan landar på http:// → rejecta
+        (downgrade-attack-skydd)."""
+        from app.services.vendor_handlers import fetch_link_receipt_for_message
+
+        msg = _make_msg(
+            body_html=(
+                '<a href="https://arlandaexpress.se/kvitto/7410356-token-1234567890">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
+        )
+        fetcher = _make_fetcher(
+            final_url="http://arlandaexpress.se/kvitto/7410356.pdf",
+        )
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
+        self.assertIsNone(result)
+
+    def test_direct_vendor_url_still_works_without_redirect(self):
+        """Bakåt-kompat: direkt arlandaexpress.se URL utan redirect (final
+        URL == entry URL) ska fortfarande accepteras."""
+        from app.services.vendor_handlers import fetch_link_receipt_for_message
+
+        msg = _make_msg(
+            body_html=(
+                '<a href="https://arlandaexpress.se/kvitto/7410356-token-1234567890">'
+                'Ladda ner kvitto (PDF)</a>'
+            ),
+        )
+        fake_pdf = b"%PDF-1.4\nok"
+        fetcher = _make_fetcher(
+            pdf=fake_pdf,
+            final_url="https://arlandaexpress.se/kvitto/7410356-token-1234567890",
+        )
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
+        self.assertEqual(result, fake_pdf)
 
     def test_returns_none_when_sender_does_not_match(self):
-        """Avsändare som inte finns i handler-registry → None.
-        Pipelinen ska då använda bilagan (default-vägen)."""
+        """Avsändare som inte finns i handler-registry → None."""
         from app.services.vendor_handlers import fetch_link_receipt_for_message
 
         msg = _make_msg(
             sender="info@some-other-vendor.com",
-            body_html='<a href="https://arlandaexpress.se/kvitto/abc">Kvitto</a>',
+            body_html='<a href="https://arlandaexpress.se/kvitto/abc-long-token">Kvitto</a>',
         )
         fetcher = MagicMock()
         result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
@@ -83,24 +161,8 @@ class ArlandaExpressLinkReceiptTest(unittest.TestCase):
         self.assertIsNone(result)
         fetcher.assert_not_called()
 
-    def test_rejects_link_to_other_domain(self):
-        """Säkerhet: kvitto-länk måste peka mot arlandaexpress.se.
-        En manipulerad länk till t.ex. evil.com ska ignoreras."""
-        from app.services.vendor_handlers import fetch_link_receipt_for_message
-
-        msg = _make_msg(
-            body_html=(
-                '<a href="https://evil.com/kvitto/long-token-abcdef1234567890">'
-                'Ladda ner kvitto (PDF)</a>'
-            ),
-        )
-        fetcher = MagicMock()
-        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
-        self.assertIsNone(result)
-        fetcher.assert_not_called()
-
-    def test_rejects_http_link_only_https_allowed(self):
-        """Säkerhet: kvitton går alltid över TLS. http:// → ignoreras."""
+    def test_rejects_http_entry_url(self):
+        """Entry måste vara HTTPS — http:// ignoreras innan fetch."""
         from app.services.vendor_handlers import fetch_link_receipt_for_message
 
         msg = _make_msg(
@@ -115,9 +177,7 @@ class ArlandaExpressLinkReceiptTest(unittest.TestCase):
         fetcher.assert_not_called()
 
     def test_accepts_subdomain_of_allowed_domain(self):
-        """Subdomäner av arlandaexpress.se (t.ex. tickets.arlandaexpress.se,
-        receipts.arlandaexpress.se) ska accepteras — A-Train AB kan rotera
-        sub-tjänster utan att vi behöver patcha."""
+        """Subdomäner av arlandaexpress.se accepteras som final URL."""
         from app.services.vendor_handlers import fetch_link_receipt_for_message
 
         msg = _make_msg(
@@ -127,13 +187,15 @@ class ArlandaExpressLinkReceiptTest(unittest.TestCase):
             ),
         )
         fake_pdf = b"%PDF-1.4\nok"
-        result = fetch_link_receipt_for_message(
-            msg, _fetcher=lambda _url: fake_pdf,
+        fetcher = _make_fetcher(
+            pdf=fake_pdf,
+            final_url="https://receipts.arlandaexpress.se/r/x.pdf",
         )
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
         self.assertEqual(result, fake_pdf)
 
     def test_returns_none_when_fetcher_raises_link_fetch_error(self):
-        """Timeout/HTTP-fel från fetch_pdf_from_link → None (fallback)."""
+        """Timeout/HTTP-fel/PDF-magic-fail från fetch_pdf_from_link → None."""
         from app.services.vendor_handlers import fetch_link_receipt_for_message
         from app.services.link_fetcher import LinkFetchError
 
@@ -185,9 +247,11 @@ class ArlandaExpressLinkReceiptTest(unittest.TestCase):
             ),
         )
         fake_pdf = b"%PDF-1.4\nok"
-        result = fetch_link_receipt_for_message(
-            msg, _fetcher=lambda _url: fake_pdf,
+        fetcher = _make_fetcher(
+            pdf=fake_pdf,
+            final_url="https://arlandaexpress.se/kvitto/7410356.pdf",
         )
+        result = fetch_link_receipt_for_message(msg, _fetcher=fetcher)
         self.assertEqual(result, fake_pdf)
 
 
