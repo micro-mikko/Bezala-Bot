@@ -39,6 +39,7 @@ from app.services.receipt_analyzer import (
     ReceiptAnalyzer,
 )
 from app.services.link_extractor import extract_receipt_link
+from app.services.vendor_handlers import fetch_link_receipt_for_message
 from app.services.settings_service import (
     build_gmail_query,
     build_gmail_query_html_only,
@@ -510,6 +511,22 @@ def _process_one_message(
             return
 
     msg = gmail.fetch_message(message_id)
+
+    # Vendor-specifik kvitto-länk (C37): vissa avsändare (Arlanda Express)
+    # skickar BÅDE bilaga (biljett/boarding pass) OCH en länk till det
+    # faktiska kvittot. Bilagan har QR-kod men saknar belopp/moms — för
+    # Bezala-attestering behöver vi länk-PDFen. Försök hämta den nu och
+    # skriv över bilagorna. Om hämtningen failar (ingen länk, fel domän,
+    # timeout) faller vi tillbaka på bilagan (bättre än inget underlag).
+    _vendor_link_pdf = fetch_link_receipt_for_message(msg)
+    if _vendor_link_pdf is not None:
+        msg.attachments = [
+            Attachment(
+                filename=f"kvitto-{message_id}.pdf",
+                mime_type="application/pdf",
+                data=_vendor_link_pdf,
+            )
+        ]
 
     # Länk-fetch-gren: avsändare matchar link_fetch_senders OCH mailet
     # saknar PDF-bilaga. Om en giltig PDF FINNS bifogad använder vi den
