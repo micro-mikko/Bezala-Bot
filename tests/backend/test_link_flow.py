@@ -183,12 +183,37 @@ class FetchPdfFromLinkTest(unittest.TestCase):
         mock_resp.status_code = 200
         mock_resp.headers = {"content-type": "application/pdf"}
         mock_resp.content = pdf_bytes
+        mock_resp.url = "https://example.com/ok.pdf"
         mock_client.get.return_value = mock_resp
 
-        result = fetch_pdf_from_link(
+        result_bytes, final_url = fetch_pdf_from_link(
             "https://example.com/ok.pdf", client=mock_client
         )
-        self.assertEqual(result, pdf_bytes)
+        self.assertEqual(result_bytes, pdf_bytes)
+        self.assertEqual(final_url, "https://example.com/ok.pdf")
+
+    def test_returns_final_url_after_redirect(self):
+        """final_url ska reflektera httpx:s slutdestination efter följda
+        redirects (för vendor_handler-validering av redirector-länkar)."""
+        from app.services.link_fetcher import fetch_pdf_from_link
+
+        pdf_bytes = b"%PDF-1.4\nredirected"
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "application/pdf"}
+        mock_resp.content = pdf_bytes
+        # httpx följde redirect: entry var SendGrid-tracker, final är vendor
+        mock_resp.url = "https://www.arlandaexpress.se/kvitto/7410356.pdf"
+        mock_client.get.return_value = mock_resp
+
+        _bytes, final_url = fetch_pdf_from_link(
+            "https://u10665393.ct.sendgrid.net/ls/click?abc",
+            client=mock_client,
+        )
+        self.assertEqual(
+            final_url, "https://www.arlandaexpress.se/kvitto/7410356.pdf",
+        )
 
 
 # ============================================================
@@ -463,7 +488,10 @@ class PipelineLinkFetchTest(unittest.TestCase):
         result = ScanResult()
         with patch(
             "app.services.vendor_handlers.fetch_pdf_from_link",
-            return_value=receipt_bytes,
+            return_value=(
+                receipt_bytes,
+                "https://www.arlandaexpress.se/kvitto/7410356.pdf",
+            ),
         ):
             _process_one_message(
                 "link-1",

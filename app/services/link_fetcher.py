@@ -86,9 +86,13 @@ def fetch_pdf_from_link(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
     client: httpx.Client | None = None,
-) -> bytes:
-    """Hämta + validera PDF från `url`. Returnerar bytes eller raiser
-    LinkFetchError. `client` kan injiceras i tester."""
+) -> tuple[bytes, str]:
+    """Hämta + validera PDF från `url`. Returnerar (pdf_bytes, final_url)
+    eller raiser LinkFetchError. `final_url` är den URL httpx landade på
+    efter följda redirects — kallaren kan validera att destinationen är
+    den förväntade (t.ex. för SendGrid-wrappade kvitto-länkar där entry-
+    URLen är en click-tracker och final-URLen är den faktiska vendor-
+    domänen). `client` kan injiceras i tester."""
     if not url or not isinstance(url, str):
         raise LinkFetchError("Tom URL")
 
@@ -148,7 +152,7 @@ def fetch_pdf_from_link(
         if not data.startswith(PDF_MAGIC):
             raise LinkFetchError("Svaret är inte en giltig PDF (magic bytes saknas)")
 
-        return data
+        return data, str(resp.url)
     finally:
         if owns_client:
             client.close()
